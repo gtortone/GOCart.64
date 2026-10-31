@@ -28,10 +28,13 @@
 
 #include "FileReader.h"
 #include "cartridge.h"
+#include "menu_t64.h"
+#include "menu_d64.h"
 
 //
 SD_STATE sd_state;
 extern CFG_FILE cfg_file;
+extern const MENU *menu;
 //
 
 void sd_format_size(char *buffer, uint32_t size) {
@@ -432,6 +435,47 @@ uint8_t sd_handle_c128_only_warning(const char *file_name, uint8_t element) {
 }
 */
 
+/*
+ * Load a PRG or P00 file in PRG_BUF and get the name to display while loading.
+ * Returns the PRG size (load address + data) or 0 on error.
+ */
+static uint32_t sd_load_prg(const char *file_name, uint8_t file_type, char *name, size_t name_size) {
+
+   FIL file;
+   if (!file_open(&file, file_name, FA_READ))
+      return 0;
+
+   size_t name_len = 0;
+
+   if (file_type == FILE_P00) {
+      P00_HEADER header;
+      if (file_read(&file, &header, sizeof(header)) != sizeof(header) ||
+          memcmp(header.signature, "C64File", 7) != 0) {
+         file_close(&file);
+         return 0;
+      }
+      // C64 file name from the header
+      for (; name_len < 16 && name_len < name_size - 1 && header.filename[name_len]; name_len++)
+         name[name_len] = sanitize_char(header.filename[name_len]);
+   } else {
+      // SD file name, limited to one line on the screen
+      for (; name_len < 32 && name_len < name_size - 1 && file_name[name_len]; name_len++) {
+         char c = sanitize_char(file_name[name_len]);
+         name[name_len] = (c >= 'a' && c <= 'z') ? c - 0x20 : c;
+      }
+   }
+   name[name_len] = 0;
+
+   uint32_t size = file_read(&file, PRG_BUF, PRG_BUF_SIZE);
+   file_close(&file);
+
+   // PRG should at least have a 2 byte load address and 1 byte of data
+   if (size <= 2 || size >= PRG_BUF_SIZE)
+      return 0;
+
+   return size;
+}
+
 uint8_t sd_handle_load(SD_STATE *state, const char *file_name, uint8_t file_type, uint8_t flags, uint8_t element) {
    switch (file_type) {
 
@@ -440,6 +484,63 @@ uint8_t sd_handle_load(SD_STATE *state, const char *file_name, uint8_t file_type
          FileReader fr(file_name);
          run_cart(fr);
          return CMD_WAIT_SYNC;
+      }
+      break;
+
+      case FILE_PRG:
+      case FILE_P00: {
+         char name[33];
+         uint32_t size = sd_load_prg(file_name, file_type, name, sizeof(name));
+         if (!size)
+            return handle_unsupported(file_name);
+
+         // the launcher is restarted in EF3 mode: from here on the menu
+         // protocol is no longer available, a failed transfer is only logged
+         run_prg(PRG_BUF, size, name);
+         return CMD_WAIT_SYNC;
+      }
+      break;
+
+      case FILE_ROM: {
+         // load in PRG_BUF padded with $FF, read one byte more than 16K to detect larger files
+         FIL file;
+         if (!file_open(&file, file_name, FA_READ))
+            return handle_unsupported(file_name);
+         memset(PRG_BUF, 0xFF, 16*1024 + 1);
+         uint32_t len = file_read(&file, PRG_BUF, 16*1024 + 1);
+         file_close(&file);
+
+         uint8_t res = run_rom(PRG_BUF, len);
+         if (res == ROM_C128)
+            return handle_unsupported_ex("Unsupported", "C128 cartridges are not supported", file_name);
+         if (res != ROM_OK)
+            return handle_unsupported(file_name);
+
+         return CMD_WAIT_SYNC;
+      }
+      break;
+
+      case FILE_D64: {
+         const MENU *d64 = d64_menu_init(file_name);
+         if (!d64)
+            return handle_unsupported(file_name);
+
+         state->search[0] = 0;
+         cfg_file.img.element = 0;
+         menu = d64;
+         return menu->dir(menu->state);
+      }
+      break;
+
+      case FILE_T64: {
+         const MENU *t64 = t64_menu_init(file_name);
+         if (!t64)
+            return handle_unsupported(file_name);
+
+         state->search[0] = 0;
+         cfg_file.img.element = 0;
+         menu = t64;
+         return menu->dir(menu->state);
       }
       break;
       /*
@@ -704,6 +805,11 @@ bool chdir_last(void)
    }
 
    return res;
+}
+
+const MENU *sd_menu_get(void)
+{
+   return &sd_menu;
 }
 
 const MENU *sd_menu_init(void)

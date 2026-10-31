@@ -39,14 +39,16 @@ int main(void) {
 #ifdef DEBUG
    while(true) {
 
-      while(!launcher_running())
+      while(!launcher_running()) {
          poll_shell();   // keep shell running after menu_loop()
+         cart_poll();    // serve the running cartridge (EAPI)
+      }
    }
 #else
    // core1 is serving the cartridge: main() must never return
    // (exit() ends in a breakpoint loop -> HardFault without a debugger)
    while(true)
-      tight_loop_contents();
+      cart_poll();      // serve the running cartridge (EAPI)
 #endif
 
    //run_shell();

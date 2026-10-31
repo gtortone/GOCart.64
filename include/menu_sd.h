@@ -69,5 +69,6 @@ uint8_t sd_handle_dir_up(SD_STATE *state, bool root);
 bool chdir_last(void);
 
 const MENU *sd_menu_init(void);
+const MENU *sd_menu_get(void);
 
 #endif

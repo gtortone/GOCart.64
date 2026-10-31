@@ -2,7 +2,6 @@
 #ifndef CRTPARSER_H
 #define CRTPARSER_H
 
-#include <vector>
 #include <cstring>
 #include <cstdio>
 
@@ -75,12 +74,7 @@ public:
       printf("hardware type: %d\n", type);
       printf("exrom: %d, game: %d\n", exrom, game);
 
-      for(uint8_t i=0; i<chips.size(); i++) {
-         printf("bank: %d\n", chips[i].number);
-         printf("\ttype: %d\n", chips[i].type);
-         printf("\tstart address: 0x%X\n", chips[i].startAddress);
-         printf("\tlength: 0x%X\n", chips[i].length);
-      }
+      printf("chips: %d, size: %lu\n", chip_count, (unsigned long)size);
    }
 
 private:
@@ -91,7 +85,8 @@ private:
    char name[33];
    uint32_t size = 0;
 
-   std::vector<ChipBlock> chips;
+   // number of chip blocks (no list kept: heap is small)
+   uint16_t chip_count = 0;
 
    uint8_t *crt_buf;
    uint32_t crt_buf_size;
@@ -130,6 +125,13 @@ private:
       } else if(type == 32) {   // fix EasyFlash bad EXROM/GAME
          exrom = 1;
          game =0;
+      } else if(type == 7 || type == 19) {
+         // Fun Play, Magic Desk: always start in 8K mode
+         exrom = 0;
+         game = 1;
+      } else if(type == 18) {
+         // Zaxxon: always 16K mode
+         exrom = game = 0;
       }
       
       // skip reserved bytes
@@ -240,14 +242,11 @@ private:
 
    void addChip(uint16_t chipType, uint8_t number, uint16_t startAddr, uint16_t blockLen) {
 
-      ChipBlock chip;
-      chip.type = chipType;
-      chip.number = number;
-      chip.startAddress = startAddr;
-      chip.length = blockLen;
-
-      chips.push_back(chip);
-      size += chip.length;
+      (void)chipType;
+      (void)number;
+      (void)startAddr;
+      chip_count++;
+      size += blockLen;
    }
 
    /*

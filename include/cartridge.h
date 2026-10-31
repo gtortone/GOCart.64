@@ -18,7 +18,13 @@ extern uint8_t __flash_binary_end[];
 #define CRT_LAUNCHER       ((uint8_t *)__flash_binary_end)
 #define CRT_LAUNCHER_SIZE  16384
 
-#define KFF_BUF   (CRT_BANK(0))
+// KFF data stream buffer (64K, 16-bit pointers): must not overlap the
+// launcher ROM copy in CRT_BANK(0), it is needed again to load PRG files
+#define KFF_BUF   (CRT_BANK(8))
+
+// PRG file buffer (64K, load address + data)
+#define PRG_BUF        (CRT_BANK(12))
+#define PRG_BUF_SIZE   (64 * 1024)
 
 // $de01 Command register in KFF RAM
 #define KFF_COMMAND (*((volatile uint8_t*)(kff_ram + 1)))
@@ -50,6 +56,16 @@ bool launcher_running(void);
 
 uint8_t run_cart(IDataReader &r);
 uint8_t run_launcher(void);
+bool run_prg(const uint8_t *prg, uint32_t size, const char *name);
+
+// raw cartridge image (.ROM/.BIN)
+#define ROM_OK            0
+#define ROM_UNSUPPORTED   1
+#define ROM_C128          2
+uint8_t run_rom(uint8_t *rom, uint32_t len);
+
+// serve requests from the running cartridge (EasyFlash EAPI), call from core0 idle loop
+void cart_poll(void);
 
 void run_cart_normal(void);
 void run_cart_magic_desk(void);
@@ -60,6 +76,7 @@ void run_cart_easyflash(void);
 void run_cart_dinamic(void);
 void run_cart_zaxxon(void);
 void run_cart_kff(void);
+void run_cart_ef3(void);
 
 void kff_set_command(uint8_t cmd);
 bool kff_get_reply(uint8_t cmd, uint8_t *reply);
