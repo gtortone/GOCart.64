@@ -1,0 +1,19 @@
+
+- build launcher
+
+cd launcher
+make
+
+- build GOCart.64 firmware
+
+cmake -B build/release -DPICO_BOARD=weact_rp2350b_core
+cmake -B build/debug -DPICO_BOARD=weact_rp2350b_core -DDEBUG=ON
+
+openocd
+-------
+
+~/fun/openocd/src/openocd -s ~/fun/openocd/tcl -f interface/cmsis-dap.cfg -f target/rp2350.cfg -c "adapter speed 20000"
+
+- to program firmware with launcher
+
+program build/debug/GOCart.64.img.bin 0x10000000 verify reset

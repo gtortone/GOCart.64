@@ -38,6 +38,8 @@ typedef struct {
     uint8_t *crt_buf;
     uint8_t **crt_banks;
     uint8_t *crt_map;
+    bool ultimax;           // cartridge starts in Ultimax mode (CRT header)
+    uint32_t bank_mask;     // 8K bank number bits decoded by the cartridge
 } core1_args_t;
 
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
@@ -50,7 +52,6 @@ uint8_t run_cart(IDataReader &r);
 uint8_t run_launcher(void);
 
 void run_cart_normal(void);
-void run_cart_normal_vic(void);
 void run_cart_magic_desk(void);
 void run_cart_ocean(void);
 void run_cart_fun_play(void);

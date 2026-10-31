@@ -162,22 +162,30 @@ private:
       uint16_t startAddr = (buf[4] << 8) | buf[5];
       uint16_t blockLen = (buf[6] << 8) | buf[7];
 
-      // map bank
-      if (number == prev_number) {
-         crt_map[number] = ram_bank_number;
-      } else if (number > ram_bank_number + 1) {
-         crt_map[number] = ram_bank_number + 1;
-         ram_bank_number++;
-      } else if (number == ram_bank_number + 1) {
-         crt_map[number] = ram_bank_number + 1;
-         ram_bank_number = number;
-      }  
+      // EasyFlash bank register is 6 bits wide (crt_map size)
+      if (number >= crt_map_size && type == 32) {
+         printf("E: CRT bank %d out of range\n", number);
+         return false;
+      }
+
+      // map bank (crt_map is only used by EasyFlash)
+      if (number < crt_map_size) {
+         if (number == prev_number) {
+            crt_map[number] = ram_bank_number;
+         } else if (number > ram_bank_number + 1) {
+            crt_map[number] = ram_bank_number + 1;
+            ram_bank_number++;
+         } else if (number == ram_bank_number + 1) {
+            crt_map[number] = ram_bank_number + 1;
+            ram_bank_number = number;
+         }
+      }
 
       prev_number = number;
 
       // calculate offset inside memory buffer
       uint32_t ofs = 0;
-      uint8_t bank = crt_map[number];
+      uint8_t bank = (number < crt_map_size) ? crt_map[number] : 0;
 
       if(startAddr == 0x8000 && blockLen <= 16*1024) {
 
@@ -234,6 +242,13 @@ private:
       //printf("bank %d, load_addr: 0x%X, ofs: %lu, crt_map[%d]: %d\n",
       //      number, startAddr, ofs, number, crt_map[number]);
       
+      // 4K images are mirrored to 8K
+      uint32_t span = (blockLen <= 4*1024) ? 8*1024 : blockLen;
+      if (ofs + span > crt_buf_size) {
+         printf("E: CRT too large for buffer (bank %d, offset %lu)\n", number, ofs);
+         return false;
+      }
+
       if (!reader.read(crt_buf+ofs, blockLen)) 
          return false;
 
