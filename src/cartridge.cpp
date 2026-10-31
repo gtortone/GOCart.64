@@ -13,7 +13,11 @@
 #include "commands.h"
 
 uint8_t crt_buf[CRT_BUFFER_SIZE] = {};
-uint8_t crt_map[64] = {};
+uint8_t crt_map[EF_MAP_SIZE] = {};
+
+// EasyFlash bank -> 8K chunk pointers (built by run_cart, read by core1)
+static uint8_t *ef_roml[EF_BANKS];
+static uint8_t *ef_romh[EF_BANKS];
 volatile uint8_t kff_ram[256] = {};
 
 // Fast look-up of 16k ROM bank address
@@ -106,6 +110,30 @@ static uint32_t cart_bank_mask(uint32_t size) {
    return mask - 1;
 }
 
+// EasyFlash: resolve the chunk map built by CRTParser into pointer tables.
+// Missing chips point to an erased (0xFF) chunk, like an empty flash.
+static void easyflash_build_tables(uint8_t chunks) {
+
+   uint8_t *blank;
+
+   if ((uint32_t)(chunks + 1) * EF_CHUNK_SIZE <= sizeof(crt_buf)) {
+      blank = crt_buf + (uint32_t)chunks * EF_CHUNK_SIZE;
+      memset(blank, 0xFF, EF_CHUNK_SIZE);
+   } else {
+      // buffer full: no room for an erased chunk
+      blank = crt_buf;
+   }
+
+   for (int bank = 0; bank < EF_BANKS; bank++) {
+      uint8_t l = crt_map[bank];
+      uint8_t h = crt_map[EF_BANKS + bank];
+      ef_roml[bank] = (l == EF_CHUNK_NONE) ? blank : crt_buf + (uint32_t)l * EF_CHUNK_SIZE;
+      ef_romh[bank] = (h == EF_CHUNK_NONE) ? blank : crt_buf + (uint32_t)h * EF_CHUNK_SIZE;
+   }
+
+   printf("EasyFlash: %d chunks (8K) used\n", chunks);
+}
+
 uint8_t run_cart(IDataReader &r) {
 
    multicore_reset_core1();
@@ -196,6 +224,7 @@ uint8_t run_cart(IDataReader &r) {
 
       case 32:
          // EasyFlash (32)
+         easyflash_build_tables(crt->getEasyFlashChunks());
          args.crt_banks = crt_banks;
          args.crt_map = crt_map;
          printf("cart: EasyFlash\n");
@@ -517,15 +546,18 @@ struct EasyFlashCart {
 
    static constexpr uint32_t COMMIT_SEL = IO1_MASK | IO2_MASK;
 
-   uint8_t **banks;
-   uint8_t *crt_map;
-   uint8_t *rom_ptr;
+   uint8_t * const *roml_tab;
+   uint8_t * const *romh_tab;
+   uint8_t *roml_ptr;
+   uint8_t *romh_ptr;
    bool ultimax;
    uint8_t ram[256];
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
       if (bus_rom_sel(control)) {
-         data = rom_ptr[bus_addr(control) & 0x3FFF];
+         // same latency as a single 16K bank: select ROML/ROMH chunk without branching
+         uint8_t *ptr = (control & ROML_MASK) ? romh_ptr : roml_ptr;
+         data = ptr[bus_addr(control) & 0x1FFF];
          return true;
       }
       if (!(control & IO2_MASK)) {
@@ -547,9 +579,12 @@ struct EasyFlashCart {
 
          switch (addr & 0xFF) {
 
-            case 0x00:     // $DE00 bank register
-               rom_ptr = banks[crt_map[data & 0x3F]];
+            case 0x00: {   // $DE00 bank register
+               uint8_t bank = data & (EF_BANKS - 1);
+               roml_ptr = roml_tab[bank];
+               romh_ptr = romh_tab[bank];
                break;
+            }
 
             case 0x02: {   // $DE02 control register
                uint8_t mode = ef_mode_table[data & 0x07];
@@ -568,16 +603,16 @@ struct EasyFlashCart {
    CART_METHOD bool vic_enabled(void) { return ultimax; }
 
    CART_METHOD uint8_t vic_read(uint32_t addr) {
-      return rom_ptr[(addr & 0x1FFF) | 0x2000];
+      return romh_ptr[addr & 0x1FFF];
    }
 };
 
 CART_FUNC void __time_critical_func(run_cart_easyflash)(void) {
 
-   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   /* core1_args_t *p = */ multicore_fifo_pop_blocking();
 
-   // EasyFlash boots in Ultimax mode (set by run_cart from CRT header)
-   EasyFlashCart cart = { p->crt_banks, p->crt_map, p->crt_banks[0], true, {} };
+   // EasyFlash boots in Ultimax mode (set by run_cart from CRT header), bank 0
+   EasyFlashCart cart = { ef_roml, ef_romh, ef_roml[0], ef_romh[0], true, {} };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();

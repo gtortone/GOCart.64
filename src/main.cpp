@@ -42,6 +42,11 @@ int main(void) {
       while(!launcher_running())
          poll_shell();   // keep shell running after menu_loop()
    }
+#else
+   // core1 is serving the cartridge: main() must never return
+   // (exit() ends in a breakpoint loop -> HardFault without a debugger)
+   while(true)
+      tight_loop_contents();
 #endif
 
    //run_shell();

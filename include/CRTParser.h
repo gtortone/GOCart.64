@@ -8,6 +8,12 @@
 
 #define NEXT_CHIP    2
 
+// EasyFlash bank packing (see CRTParser::parseEasyFlashChip)
+#define EF_BANKS        64
+#define EF_MAP_SIZE     (2 * EF_BANKS)
+#define EF_CHUNK_SIZE   (8 * 1024)
+#define EF_CHUNK_NONE   0xFF
+
 struct ChipBlock {
    uint8_t type;              // 0:ROM, 1:RAM, 2:FLASH
    uint8_t number;
@@ -92,9 +98,9 @@ private:
    uint8_t *crt_map;
    uint8_t crt_map_size;
 
-   // temp data
-   uint8_t prev_number = 0;
-   uint8_t ram_bank_number= 0;
+   // EasyFlash packing state
+   bool ef_init = false;
+   uint8_t ef_chunks = 0;
  
    bool parseHeader(void) {
 
@@ -162,30 +168,15 @@ private:
       uint16_t startAddr = (buf[4] << 8) | buf[5];
       uint16_t blockLen = (buf[6] << 8) | buf[7];
 
-      // EasyFlash bank register is 6 bits wide (crt_map size)
-      if (number >= crt_map_size && type == 32) {
-         printf("E: CRT bank %d out of range\n", number);
-         return false;
+      if (type == 32) {
+         if (!parseEasyFlashChip(number, startAddr, blockLen))
+            return false;
+         addChip(chipType, number, startAddr, blockLen);
+         return NEXT_CHIP;
       }
-
-      // map bank (crt_map is only used by EasyFlash)
-      if (number < crt_map_size) {
-         if (number == prev_number) {
-            crt_map[number] = ram_bank_number;
-         } else if (number > ram_bank_number + 1) {
-            crt_map[number] = ram_bank_number + 1;
-            ram_bank_number++;
-         } else if (number == ram_bank_number + 1) {
-            crt_map[number] = ram_bank_number + 1;
-            ram_bank_number = number;
-         }
-      }
-
-      prev_number = number;
 
       // calculate offset inside memory buffer
       uint32_t ofs = 0;
-      uint8_t bank = (number < crt_map_size) ? crt_map[number] : 0;
 
       if(startAddr == 0x8000 && blockLen <= 16*1024) {
 
@@ -206,11 +197,6 @@ private:
             if(odd_bank)
                ofs += 8*1024;
       
-         } else if(blockLen <= 8*1024 && (type == 32) ) {
-
-            // EasyFlash
-            ofs = bank * 16*1024;
-
          } else {
 
             ofs = number * 16*1024;
@@ -222,30 +208,21 @@ private:
          if (type == 5) {
             // Ocean
             ofs = (number % 16) * 16*1024 + 8*1024;
-         } else if(type == 32) {
-            // EasyFlash
-            ofs = bank * 16*1024 + 8*1024;
          } else {
             ofs = number * 16*1024 + 8*1024;
          }
 
       } else if(startAddr == 0xf000 && blockLen <= 4*1024 ) {
 
-         if(type == 32) {
-            // EasyFlash
-            ofs = bank * 16*1024 + 8*1024;
-         } else {
-            ofs = number * 16*1024 + 8*1024;
-         }
+         ofs = number * 16*1024 + 8*1024;
       }
 
-      //printf("bank %d, load_addr: 0x%X, ofs: %lu, crt_map[%d]: %d\n",
-      //      number, startAddr, ofs, number, crt_map[number]);
+      //printf("bank %d, load_addr: 0x%X, ofs: %lu\n", number, startAddr, ofs);
       
       // 4K images are mirrored to 8K
       uint32_t span = (blockLen <= 4*1024) ? 8*1024 : blockLen;
       if (ofs + span > crt_buf_size) {
-         printf("E: CRT too large for buffer (bank %d, offset %lu)\n", number, ofs);
+         printf("E: CRT too large for buffer (bank %d, offset %lu)\n", number, (unsigned long)ofs);
          return false;
       }
 
@@ -256,17 +233,108 @@ private:
       if (blockLen <= 4*1024)
          memcpy(crt_buf+ofs+(4*1024), crt_buf+ofs, 4*1024);
 
+      addChip(chipType, number, startAddr, blockLen);
+
+      return NEXT_CHIP;
+   }
+
+   void addChip(uint16_t chipType, uint8_t number, uint16_t startAddr, uint16_t blockLen) {
+
       ChipBlock chip;
       chip.type = chipType;
       chip.number = number;
       chip.startAddress = startAddr;
       chip.length = blockLen;
-      
+
       chips.push_back(chip);
       size += chip.length;
-
-      return NEXT_CHIP;
    }
+
+   /*
+    * EasyFlash
+    *
+    * Up to 64 banks, each one with an optional 8K ROML and 8K ROMH chip.
+    * Most images use only ROML in many banks, so chips are packed in crt_buf
+    * as 8K chunks in load order, instead of one 16K slot per bank.
+    *
+    * crt_map layout (EF_MAP_SIZE bytes):
+    *   crt_map[bank]                -> ROML chunk index
+    *   crt_map[EF_BANKS + bank]     -> ROMH chunk index
+    *   EF_CHUNK_NONE                -> chip not present
+    *
+    * chunk n is at crt_buf + n * EF_CHUNK_SIZE
+    */
+   bool parseEasyFlashChip(uint8_t number, uint16_t startAddr, uint16_t blockLen) {
+
+      if (crt_map_size < EF_MAP_SIZE) {
+         printf("E: EasyFlash map too small\n");
+         return false;
+      }
+
+      if (number >= EF_BANKS) {
+         printf("E: EasyFlash bank %d out of range\n", number);
+         return false;
+      }
+
+      if (!ef_init) {
+         memset(crt_map, EF_CHUNK_NONE, EF_MAP_SIZE);
+         ef_chunks = 0;
+         ef_init = true;
+      }
+
+      // a 16K chip at $8000 fills both ROML and ROMH
+      uint8_t parts = 1;
+      uint8_t *slot;
+
+      if (startAddr == 0x8000 && blockLen <= 8*1024) {
+         slot = &crt_map[number];
+      } else if (startAddr == 0x8000 && blockLen <= 16*1024) {
+         slot = &crt_map[number];
+         parts = 2;
+      } else if ((startAddr == 0xa000 || startAddr == 0xe000) && blockLen <= 8*1024) {
+         slot = &crt_map[EF_BANKS + number];
+      } else if (startAddr == 0xf000 && blockLen <= 4*1024) {
+         slot = &crt_map[EF_BANKS + number];
+      } else {
+         printf("E: EasyFlash chip bank %d at 0x%X len 0x%X not supported\n", number, startAddr, blockLen);
+         return false;
+      }
+
+      for (uint8_t i = 0; i < parts; i++) {
+
+         uint16_t len = (parts == 2) ? 8*1024 : blockLen;
+         uint8_t *map = (i == 0) ? slot : &crt_map[EF_BANKS + number];
+
+         // reuse the chunk if the same chip appears twice
+         uint8_t chunk = *map;
+         if (chunk == EF_CHUNK_NONE) {
+            if ((uint32_t)(ef_chunks + 1) * EF_CHUNK_SIZE > crt_buf_size) {
+               printf("E: CRT too large for buffer (bank %d)\n", number);
+               return false;
+            }
+            chunk = ef_chunks++;
+            *map = chunk;
+         }
+
+         uint8_t *dst = crt_buf + (uint32_t)chunk * EF_CHUNK_SIZE;
+         if (!reader.read(dst, len))
+            return false;
+
+         // startAddr $F000: 4K image mirrored to 8K (ROMH $E000-$FFFF)
+         if (len <= 4*1024)
+            memcpy(dst + 4*1024, dst, 4*1024);
+      }
+
+      return true;
+   }
+
+public:
+   // number of 8K chunks used by an EasyFlash image (valid after parse())
+   uint8_t getEasyFlashChunks(void) {
+      return ef_chunks;
+   }
+
+private:
 };
 
 #endif
