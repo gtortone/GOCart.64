@@ -164,7 +164,7 @@ static bool test_launch(const char *file_name) {
 
       case FILE_CRT: {
          FileReader fr(file_name);
-         return run_cart(fr) == 0;
+         return run_cart(fr, file_name) == 0;
       }
 
       case FILE_ROM: {

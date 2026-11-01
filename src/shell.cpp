@@ -114,7 +114,7 @@ void poll_shell(void) {
             if(fr.eof())
                printf("E: file not found (%s)\n", prev_path);
             else
-               run_cart(fr);
+               run_cart(fr, prev_path);
          } else if (strcmp(token, "test") == 0) {
             // launch every supported file of the current directory
             // parameters (any order): [start index] [pattern] [noclean]

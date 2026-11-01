@@ -483,7 +483,7 @@ uint8_t sd_handle_load(SD_STATE *state, const char *file_name, uint8_t file_type
       case FILE_CRT: {
          //FIL file;
          FileReader fr(file_name);
-         if (run_cart(fr) == 0)
+         if (run_cart(fr, file_name) == 0)
             config_save();      // start from here at the next power on
          return CMD_WAIT_SYNC;
       }

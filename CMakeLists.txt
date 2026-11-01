@@ -21,7 +21,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
 # Debug
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 
-option(DEBUG "Enable debug prints on UART" OFF)
+option(DEBUG "Enable shell and debug prints on UART" OFF)
 
 # Initialize the SDK
 pico_sdk_init()

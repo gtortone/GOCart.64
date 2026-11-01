@@ -54,7 +54,9 @@ void launcher_enable(void);
 void launcher_disable(void);
 bool launcher_running(void);
 
-uint8_t run_cart(IDataReader &r);
+// file_name: CRT file (relative to the current directory or absolute), used
+// for the EasyFlash save file "<name>.sav"; NULL: changes are not saved
+uint8_t run_cart(IDataReader &r, const char *file_name = NULL);
 uint8_t run_launcher(void);
 bool run_prg(const uint8_t *prg, uint32_t size, const char *name);
 

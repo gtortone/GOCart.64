@@ -11,14 +11,6 @@
 #include "board.h"
 #include "debug.h"
 
-void sync_with_vic(void) {
-   // wait until the raster beam is in the upper or lower border (if VIC-II is enabled)
-   uint32_t control;
-   do {
-      GPIO_GET_LOW_32(control);
-   } while( !(control & BA_MASK) );
-}
-
 void board_setup(void) {
 
    // standard overclock

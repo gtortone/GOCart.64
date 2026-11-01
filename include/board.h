@@ -90,10 +90,6 @@
 #define SYST_RVR (*(volatile uint32_t*)0xE000E014)
 #define SYST_CVR (*(volatile uint32_t*)0xE000E018)
 
-#define wait_until(t) { for(int i=0; i<t; i++) asm volatile("nop\n"); } // 3 ns for each nop (@330Mhz)
-
 void board_setup(void);
-void wait_valid_clock(void);
-void sync_with_vic(void);
 
 #endif

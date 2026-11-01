@@ -9,7 +9,6 @@ void c64_hold_reset(void) {
 }
 
 void c64_release_reset(void) {
-   //sync_with_vic();
    gpio_put(RESET,0);
 }
 
