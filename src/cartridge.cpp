@@ -31,9 +31,17 @@ static volatile uint8_t ef_cur_bank;
 // EAPI commands are served by cart_poll() on core0
 static bool eapi_active = false;
 
-// DEBUG only: trace of EasyFlash register writes ($DE00/$DE02),
-// recorded by core1 and printed by cart_poll() on core0
-#ifdef DEBUG
+/*
+ * EF_DEBUG_TRACE (needs a DEBUG build)
+ *   1: trace of EasyFlash register writes ($DE00/$DE02), recorded by core1
+ *      and printed on the console by cart_poll()
+ *   0: disabled
+ */
+#ifndef EF_DEBUG_TRACE
+#define EF_DEBUG_TRACE   0
+#endif
+
+#if defined(DEBUG) && EF_DEBUG_TRACE
 #define EF_TRACE_SIZE   64
 static volatile uint16_t ef_trace[EF_TRACE_SIZE];   // reg << 8 | data
 static volatile uint32_t ef_trace_head;
@@ -61,6 +69,47 @@ static volatile uint8_t ef3_tx_rdy = EF3_TX_RDY;    // C64 may send data
 static volatile uint8_t ef3_rx_data;
 static volatile uint8_t ef3_tx_data;
 static uint8_t ef3_ram[256];
+
+// last bytes received from the C64, to recognize "KFF:" EAPI commands (cart_poll)
+static uint8_t eapi_window[5];
+
+/*
+ * Stop the running cartridge before another one is started (launcher, CRT,
+ * ROM, PRG): core1 is reset, the C64 is held in reset with the cartridge
+ * disconnected while the new file is loaded (the new core1 handler releases
+ * it with c64_reset()), and the state shared between the cores is cleared.
+ * The handler state (EasyFlash RAM, bank, locks...) is local to core1 and is
+ * created again by every handler.
+ */
+// C64 clean start before every cartridge/program (see run_c64_clean)
+static bool c64_clean_enabled = true;
+
+void c64_clean_enable(bool enable) {
+   c64_clean_enabled = enable;
+}
+
+bool c64_clean_is_enabled(void) {
+   return c64_clean_enabled;
+}
+
+// power-on like C64 state before a cartridge/program is started, if enabled
+static void c64_clean_before_start(void) {
+   if (c64_clean_enabled)
+      run_c64_clean();
+}
+
+static void cart_stop(void) {
+
+   multicore_reset_core1();
+
+   c64_hold_reset();
+   c64_set_exrom_game(1, 1);
+
+   eapi_active = false;
+   ef3_rx_rdy = EF3_NOT_RDY;
+   ef3_tx_rdy = EF3_TX_RDY;
+   memset(eapi_window, 0, sizeof(eapi_window));
+}
 volatile uint8_t kff_ram[256] = {};
 
 // Fast look-up of 16k ROM bank address
@@ -120,8 +169,7 @@ uint8_t run_launcher(void) {
    // static: core1 reads it after this function has returned
    static core1_args_t args;
 
-   multicore_reset_core1();
-   eapi_active = false;
+   cart_stop();
 
    // init cart memory
    memset(crt_buf, 0, sizeof(crt_buf));
@@ -189,8 +237,8 @@ uint8_t run_rom(uint8_t *rom, uint32_t len) {
    printf("\nrom: %lu bytes, %s\n", (unsigned long)len,
           exrom ? "Ultimax" : (game ? "8K" : "16K"));
 
-   multicore_reset_core1();
-   eapi_active = false;
+   c64_clean_before_start();
+   cart_stop();
 
    // the launcher ROM copy in crt_buf is replaced by the cartridge image
    memcpy(crt_buf, rom, 16*1024);
@@ -263,11 +311,8 @@ static void easyflash_build_tables(uint8_t chunks) {
 
 uint8_t run_cart(IDataReader &r) {
 
-   multicore_reset_core1();
-
-   eapi_active = false;
-   ef3_rx_rdy = EF3_NOT_RDY;
-   ef3_tx_rdy = EF3_TX_RDY;
+   c64_clean_before_start();
+   cart_stop();
 
    // init cart memory
    memset(crt_buf, 0, sizeof(crt_buf));
@@ -280,6 +325,7 @@ uint8_t run_cart(IDataReader &r) {
    if (crt->parse() != true) {
       printf("E: CRT parsing error\n");
       delete crt;
+      c64_release_reset();      // no cartridge: the C64 starts BASIC
       return 1;
    }
 
@@ -961,6 +1007,132 @@ void kff_dump(void) {
 }
 
 /*
+ * C64 "clean start": brings the C64 to a power-on like state before a
+ * cartridge is started. The VIC-II has no reset line and keeps its registers
+ * (graphics mode, sprites, raster IRQ), and a reset does not clear RAM: a
+ * cartridge that boots directly could find the state left by the previous one.
+ *
+ * c64_clean_code is an Ultimax program at $E000 (ROMH) that:
+ *  - sets VIC-II and SID registers to 0 (screen and sprites off)
+ *  - copies a routine to $0200 and runs it with the cartridge off ($DE02)
+ *    and all RAM visible ($01 = $34): clears RAM $0300-$FFFF, zero page and
+ *    stack, then color RAM with I/O visible
+ *  - writes $DE01 when done (about 0.7 s) and loops at $0240
+ * Source and test: 6502 code assembled and checked with py65 on a C64 memory
+ * model (RAM, color RAM, VIC-II and SID cleared).
+ */
+static const uint8_t c64_clean_code[] = {
+   0x78, 0xA2, 0xFF, 0x9A, 0xD8, 0xA9, 0x2F, 0x85, 0x00, 0xA9, 0x37, 0x85,
+   0x01, 0xA9, 0x00, 0x8D, 0x11, 0xD0, 0x8D, 0x15, 0xD0, 0x8D, 0x1A, 0xD0,
+   0xA2, 0x2E, 0x9D, 0x00, 0xD0, 0xCA, 0x10, 0xFA, 0xA9, 0xFF, 0x8D, 0x19,
+   0xD0, 0xA9, 0x00, 0xA2, 0x18, 0x9D, 0x00, 0xD4, 0xCA, 0x10, 0xFA, 0xA2,
+   0x42, 0xBD, 0x3E, 0xE0, 0x9D, 0x00, 0x02, 0xCA, 0x10, 0xF7, 0x4C, 0x00,
+   0x02, 0x40, 0xA9, 0x04, 0x8D, 0x02, 0xDE, 0xA9, 0x34, 0x85, 0x01, 0xA9,
+   0x00, 0xA2, 0x03, 0x8E, 0x14, 0x02, 0xA0, 0x00, 0x99, 0x00, 0x03, 0xC8,
+   0xD0, 0xFA, 0xE8, 0xD0, 0xF2, 0xA2, 0x02, 0x95, 0x00, 0xE8, 0xD0, 0xFB,
+   0x9D, 0x00, 0x01, 0xE8, 0xD0, 0xFA, 0xA2, 0x35, 0x86, 0x01, 0xA2, 0x00,
+   0x9D, 0x00, 0xD8, 0x9D, 0x00, 0xD9, 0x9D, 0x00, 0xDA, 0x9D, 0x00, 0xDB,
+   0xE8, 0xD0, 0xF1, 0x8D, 0x01, 0xDE, 0x4C, 0x40, 0x02, 0xFF, 0xFF, 0xFF,
+};
+
+#define C64_CLEAN_RESET      0xE000      // reset vector
+#define C64_CLEAN_IRQ        0xE03D      // NMI/IRQ vector: RTI
+#define C64_CLEAN_TIMEOUT_US (3 * 1000 * 1000)
+
+static volatile bool c64_clean_done;
+
+struct CleanCart {
+
+   static constexpr uint32_t COMMIT_SEL = IO1_MASK;
+
+   uint8_t *romh;
+   bool ultimax;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (!(control & ROMH_MASK)) {
+         data = romh[bus_addr(control) & 0x1FFF];
+         return true;
+      }
+      return false;
+   }
+
+   // the cartridge is turned off during the write cycle (see c64_bus.h)
+   CART_METHOD void early_commit(uint32_t control) {
+      if ((bus_addr(control) & 0xFF) == 0x02)
+         c64_set_exrom_game(1, 1);
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      if (control & RW_MASK)
+         return;
+      switch (bus_addr(control) & 0xFF) {
+         case 0x01:     // $DE01: clean done
+            c64_clean_done = true;
+            break;
+         case 0x02:     // $DE02: cartridge off
+            c64_set_exrom_game(1, 1);
+            ultimax = false;
+            break;
+      }
+   }
+
+   CART_METHOD bool vic_enabled(void) { return ultimax; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) {
+      return romh[addr & 0x1FFF];
+   }
+};
+
+CART_FUNC void __time_critical_func(run_cart_clean)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   CleanCart cart = { p->crt_buf, true };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+bool run_c64_clean(void) {
+
+   // static: core1 reads it after this function has returned
+   static core1_args_t args;
+
+   cart_stop();
+
+   // 8K ROMH image in crt_buf (any cartridge started after this reloads it)
+   uint8_t *romh = crt_buf;
+   memset(romh, 0xFF, 8*1024);
+   memcpy(romh, c64_clean_code, sizeof(c64_clean_code));
+   romh[0x1FFA] = C64_CLEAN_IRQ & 0xFF;      // NMI
+   romh[0x1FFB] = C64_CLEAN_IRQ >> 8;
+   romh[0x1FFC] = C64_CLEAN_RESET & 0xFF;    // RESET
+   romh[0x1FFD] = C64_CLEAN_RESET >> 8;
+   romh[0x1FFE] = C64_CLEAN_IRQ & 0xFF;      // IRQ
+   romh[0x1FFF] = C64_CLEAN_IRQ >> 8;
+
+   c64_clean_done = false;
+   c64_set_exrom_game(1, 0);     // Ultimax
+   args = {};
+   args.crt_buf = romh;
+   multicore_launch_core1(run_cart_clean);
+   multicore_fifo_push_blocking((uint32_t)&args);
+
+   uint64_t t0 = time_us_64();
+   while (!c64_clean_done && time_us_64() - t0 < C64_CLEAN_TIMEOUT_US)
+      tight_loop_contents();
+
+   bool done = c64_clean_done;
+   if (!done)
+      printf("E: C64 clean start timeout\n");
+
+   // keep the C64 in reset until the next cartridge is started
+   cart_stop();
+   return done;
+}
+
+/*
  * KungFuFlash launcher
  *
  * $DE00 read/write: data register (KFF_BUF stream)
@@ -1248,8 +1420,8 @@ bool run_prg(const uint8_t *prg, uint32_t size, const char *name) {
       return false;
    }
 
-   multicore_reset_core1();
-   eapi_active = false;
+   c64_clean_before_start();
+   cart_stop();
 
    // launcher ROM copy (crt_buf is not cleared: prg may be inside it)
    memcpy(crt_buf, CRT_LAUNCHER, CRT_LAUNCHER_SIZE);
@@ -1262,9 +1434,6 @@ bool run_prg(const uint8_t *prg, uint32_t size, const char *name) {
    text[sizeof(text) - 1] = 0;
    dest = convert_to_screen_code(dest, text);
    *dest = 0;
-
-   ef3_rx_rdy = EF3_NOT_RDY;
-   ef3_tx_rdy = EF3_TX_RDY;
 
    printf("\nprg: %s (%lu bytes)\n", name, (unsigned long)size);
 
@@ -1379,7 +1548,7 @@ static uint8_t eapi_erase_sector(uint16_t addr, uint8_t bank) {
    return REPLY_EAPI_OK;
 }
 
-#ifdef DEBUG
+#if defined(DEBUG) && EF_DEBUG_TRACE
 // print EasyFlash register writes, repeated $DE00 writes are counted
 static void ef_trace_print(void) {
 
@@ -1412,9 +1581,8 @@ static void ef_trace_print(void) {
 
 void cart_poll(void) {
 
-   static uint8_t window[5];
 
-#ifdef DEBUG
+#if defined(DEBUG) && EF_DEBUG_TRACE
    if (eapi_active)
       ef_trace_print();
 #endif
@@ -1426,14 +1594,14 @@ void cart_poll(void) {
    if (!ef3_getc(&c))
       return;
 
-   memmove(window, window + 1, sizeof(window) - 1);
-   window[sizeof(window) - 1] = c;
+   memmove(eapi_window, eapi_window + 1, sizeof(eapi_window) - 1);
+   eapi_window[sizeof(eapi_window) - 1] = c;
 
-   if (memcmp(window, "KFF:", 4) != 0)
+   if (memcmp(eapi_window, "KFF:", 4) != 0)
       return;
 
-   uint8_t cmd = window[4];
-   memset(window, 0, sizeof(window));
+   uint8_t cmd = eapi_window[4];
+   memset(eapi_window, 0, sizeof(eapi_window));
 
    uint8_t reply = REPLY_EAPI_OK;
 

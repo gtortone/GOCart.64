@@ -440,7 +440,7 @@ uint8_t sd_handle_c128_only_warning(const char *file_name, uint8_t element) {
  * Load a PRG or P00 file in PRG_BUF and get the name to display while loading.
  * Returns the PRG size (load address + data) or 0 on error.
  */
-static uint32_t sd_load_prg(const char *file_name, uint8_t file_type, char *name, size_t name_size) {
+uint32_t sd_load_prg(const char *file_name, uint8_t file_type, char *name, size_t name_size) {
 
    FIL file;
    if (!file_open(&file, file_name, FA_READ))

@@ -63,6 +63,8 @@ void sd_file_open(FIL *file, const char *file_name);
 uint8_t sd_handle_crt_unsupported(uint32_t cartridge_type);
 bool sd_c128_only_warning(uint8_t flags);
 uint8_t sd_handle_c128_only_warning(const char *file_name, uint8_t element);
+// load a PRG/P00 file in PRG_BUF, returns the PRG size or 0 (name: shown while loading)
+uint32_t sd_load_prg(const char *file_name, uint8_t file_type, char *name, size_t name_size);
 uint8_t sd_handle_load(SD_STATE *state, const char *file_name, uint8_t file_type, uint8_t flags, uint8_t element);
 uint8_t sd_handle_select(SD_STATE *state, uint8_t flags, uint8_t element);
 uint8_t sd_handle_dir_up(SD_STATE *state, bool root);

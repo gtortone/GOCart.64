@@ -64,6 +64,15 @@ bool run_prg(const uint8_t *prg, uint32_t size, const char *name);
 #define ROM_C128          2
 uint8_t run_rom(uint8_t *rom, uint32_t len);
 
+// bring the C64 to a power-on like state (RAM, VIC-II, SID cleared),
+// the C64 is then kept in reset until the next cartridge is started
+bool run_c64_clean(void);
+
+// clean start before every cartridge/program (run_cart, run_rom, run_prg),
+// enabled by default
+void c64_clean_enable(bool enable);
+bool c64_clean_is_enabled(void);
+
 // serve requests from the running cartridge (EasyFlash EAPI), call from core0 idle loop
 void cart_poll(void);
 

@@ -12,6 +12,7 @@
 #include "cartridge.h"
 #include "filesystem.h"
 #include "menu.h"
+#include "shell_test.h"
 
 #define CMD_BUFFER_SIZE    128
 #define PATH_BUFFER_SIZE   128
@@ -114,6 +115,38 @@ void poll_shell(void) {
                printf("E: file not found (%s)\n", prev_path);
             else
                run_cart(fr);
+         } else if (strcmp(token, "test") == 0) {
+            // launch every supported file of the current directory
+            // parameters (any order): [start index] [pattern] [noclean]
+            const char *pattern = NULL;
+            uint32_t start = 1;
+            bool clean = true;
+            while ((token = strtok(NULL, " ")) != NULL) {
+               char *end;
+               unsigned long n = strtoul(token, &end, 10);
+               if (*token && !*end)
+                  start = n;
+               else if (strcmp(token, "noclean") == 0)
+                  clean = false;
+               else
+                  pattern = token;
+            }
+            shell_test(pattern, start, clean);
+         } else if (strcmp(token, "clean") == 0) {
+            // power-on like C64 state (RAM, VIC-II, SID cleared)
+            // parameter: [on | off]  enable/disable it before every launch,
+            //            no parameter: run it now (C64 kept in reset)
+            token = strtok(NULL, " ");
+            if (token && strcmp(token, "on") == 0) {
+               c64_clean_enable(true);
+            } else if (token && strcmp(token, "off") == 0) {
+               c64_clean_enable(false);
+            } else if (token) {
+               printf("clean [on | off]\n");
+            } else {
+               printf("C64 clean start: %s\n", run_c64_clean() ? "done" : "failed");
+            }
+            printf("clean start before every launch: %s\n", c64_clean_is_enabled() ? "on" : "off");
          } else if (strcmp(token, "lss") == 0) {
             // list files/directories
             FILINFO *file_list = (FILINFO *)(crt_buf + 3*16*1024); // start from CRT_BANK(2)
