@@ -45,6 +45,7 @@ static volatile uint32_t ef_trace_head;
 #define EF_TRACE(reg, data) do { } while (0)
 #endif
 
+
 /*
  * EF3 USB registers ($DE09 status, $DE0A data), used by:
  *  - the launcher in EF3 mode, to load PRG files
@@ -469,6 +470,17 @@ struct MagicDeskCart {
       }
    }
 
+   // cartridge on/off takes effect during the write cycle (see early_commit
+   // in c64_bus.h), the bank is switched at the end of the cycle
+   CART_METHOD void early_commit(uint32_t control) {
+      if (!(bus_addr(control) & 0xFF)) {
+         if (bus_data(control) & 0x80)
+            c64_set_exrom_game(1, 1);     // none
+         else
+            c64_set_exrom_game(0, 1);     // 8K
+      }
+   }
+
    CART_METHOD bool vic_enabled(void) { return false; }
 
    CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
@@ -565,6 +577,17 @@ struct FunPlayCart {
       }
    }
 
+   // cartridge on/off takes effect during the write cycle (see early_commit
+   // in c64_bus.h), the bank is switched at the end of the cycle
+   CART_METHOD void early_commit(uint32_t control) {
+      if (bus_addr(control) == 0xDE00) {
+         if (bus_data(control) & 0x80)
+            c64_set_exrom_game(1, 1);     // none
+         else
+            c64_set_exrom_game(0, 1);     // 8K
+      }
+   }
+
    CART_METHOD bool vic_enabled(void) { return false; }
 
    CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
@@ -622,6 +645,17 @@ struct SuperGamesCart {
 
       if (data & 0x08)
          locked = true;
+   }
+
+   // cartridge on/off takes effect during the write cycle (see early_commit
+   // in c64_bus.h); bank and lock are applied at the end of the cycle
+   CART_METHOD void early_commit(uint32_t control) {
+      if (locked)
+         return;
+      if (bus_data(control) & 0x04)
+         c64_set_exrom_game(1, 1);        // none
+      else
+         c64_set_exrom_game(0, 0);        // 16K
    }
 
    CART_METHOD bool vic_enabled(void) { return false; }
@@ -755,11 +789,22 @@ struct EasyFlashCart {
       }
    }
 
+   // $DE02 takes effect during the write cycle, at every sample (like the
+   // original firmware): a cartridge disabled from ROM must already be off
+   // at the next opcode fetch (e.g. Biggles)
+   CART_METHOD void early_commit(uint32_t control) {
+      if (!(control & IO1_MASK) && (bus_addr(control) & 0xFF) == 0x02) {
+         uint8_t mode = ef_mode_table[bus_data(control) & 0x07];
+         c64_set_exrom_game(mode >> 1, mode & 0x01);
+      }
+   }
+
    CART_METHOD bool vic_enabled(void) { return ultimax; }
 
    CART_METHOD uint8_t vic_read(uint32_t addr) {
       return romh_ptr[addr & 0x1FFF];
    }
+
 };
 
 CART_FUNC void __time_critical_func(run_cart_easyflash)(void) {
@@ -987,6 +1032,16 @@ struct KffCart {
       }
    }
 
+   // $DE02 takes effect during the write cycle (see early_commit in c64_bus.h)
+   CART_METHOD void early_commit(uint32_t control) {
+      if ((bus_addr(control) & 0xFF) == 0x02) {
+         if (bus_data(control) & 0x01)
+            c64_set_exrom_game(0, 0);     // 16K ROM
+         else
+            c64_set_exrom_game(1, 1);     // none
+      }
+   }
+
    CART_METHOD bool vic_enabled(void) { return ultimax; }
 
    CART_METHOD uint8_t vic_read(uint32_t addr) {
@@ -1096,6 +1151,14 @@ struct Ef3Cart {
       } else {
          // $DF00-$DFFF RAM
          ef3_ram[reg] = data;
+      }
+   }
+
+   // $DE02 takes effect during the write cycle (see EasyFlashCart)
+   CART_METHOD void early_commit(uint32_t control) {
+      if ((bus_addr(control) & 0xFF) == 0x02 && !(control & IO1_MASK)) {
+         uint8_t mode = ef_mode_table[bus_data(control) & 0x07];
+         c64_set_exrom_game(mode >> 1, mode & 0x01);
       }
    }
 
@@ -1345,6 +1408,7 @@ static void ef_trace_print(void) {
    }
 }
 #endif
+
 
 void cart_poll(void) {
 

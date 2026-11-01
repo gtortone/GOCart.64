@@ -28,6 +28,7 @@
 #include "menu_sd.h"
 #include "file_types.h"
 #include "cartridge.h"
+#include "config.h"
 
 extern const MENU *menu;
 extern CFG_FILE cfg_file;
@@ -206,7 +207,8 @@ static uint8_t t64_select(T64_STATE *state, uint8_t flags, uint8_t element_no) {
 
    // the launcher is restarted in EF3 mode: from here on the menu protocol
    // is no longer available, a failed transfer is only logged
-   run_prg(PRG_BUF, size, name);
+   if (run_prg(PRG_BUF, size, name))
+      config_save();      // start from this directory at the next power on
    return CMD_WAIT_SYNC;
 }
 

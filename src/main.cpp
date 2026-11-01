@@ -9,6 +9,7 @@
 #include "cartridge.h"
 #include "menu.h"
 #include "shell.h"
+#include "config.h"
 
 int main(void) {
    
@@ -22,6 +23,8 @@ int main(void) {
    // mount SD
    if(!filesystem_mount())
       printf("E: SD mount failed\n");
+   else
+      config_load();    // directory of the last launched file
 
    // setup I2C irq handler
    i2c_slave_init(i2c0, I2C_ADDR, &i2c_slave_handler);

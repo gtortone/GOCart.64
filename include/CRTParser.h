@@ -65,6 +65,14 @@ public:
             break;
          else return false;
       }
+
+      // Ocean: the header is often wrong. 128K/256K images also have ROMH
+      // chips and need 16K mode, smaller ones (e.g. Wonderboy) are 8K
+      if (type == 5) {
+         exrom = 0;
+         game = has_romh ? 0 : 1;
+      }
+
       return true;
    }
 
@@ -87,6 +95,9 @@ private:
 
    // number of chip blocks (no list kept: heap is small)
    uint16_t chip_count = 0;
+
+   // at least one chip is mapped to ROMH ($A000/$E000)
+   bool has_romh = false;
 
    uint8_t *crt_buf;
    uint32_t crt_buf_size;
@@ -119,10 +130,8 @@ private:
       exrom = bool(buf[0]);
       game = bool(buf[1]);
 
-      // fix Ocean bad EXROM/GAME
-      if(type == 5) {
-         exrom = game = 0;
-      } else if(type == 32) {   // fix EasyFlash bad EXROM/GAME
+      // Ocean: EXROM/GAME are set after the chips are parsed (see parse())
+      if(type == 32) {   // fix EasyFlash bad EXROM/GAME
          exrom = 1;
          game =0;
       } else if(type == 7 || type == 19) {
@@ -182,6 +191,10 @@ private:
 
       if(startAddr == 0x8000 && blockLen <= 16*1024) {
 
+         // a 16K chip at $8000 also covers ROMH
+         if (blockLen > 8*1024)
+            has_romh = true;
+
          // Support ROML only cartridges with more than 64 banks
          if(blockLen<= 8*1024 && (type == 7) ) {
 
@@ -206,6 +219,8 @@ private:
 
       // ROMH bank
       } else if((startAddr == 0xa000 || startAddr == 0xe000) && blockLen <= 8*1024 ) {
+
+         has_romh = true;
 
          if (type == 5) {
             // Ocean

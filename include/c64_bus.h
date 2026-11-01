@@ -1,6 +1,7 @@
 #ifndef C64_BUS_H
 #define C64_BUS_H
 
+#include <type_traits>
 #include "pico/stdlib.h"
 #include "board.h"
 #include "c64_interface.h"
@@ -48,6 +49,16 @@
  *
  *   uint8_t vic_read(uint32_t addr)
  *       data for a VIC-II fetch through ROMH
+ *
+ *   void early_commit(uint32_t control)   (optional)
+ *       called at every sample of a write cycle on a COMMIT_SEL line, during
+ *       the CPU phase (from the C64_BUS_EARLY_COMMIT_SAMPLES-th sample). Only
+ *       for idempotent registers that must take effect at the very next cycle,
+ *       e.g. disabling the cartridge from ROM: EXROM/GAME are released and
+ *       raised by the C64 pull-ups, which takes time. The first samples may
+ *       carry a value that is not valid yet: it is overwritten by the next
+ *       ones. commit() is still called at the end of the cycle.
+
  */
 
 #define BUS_INLINE   static inline __attribute__((always_inline))
@@ -77,6 +88,15 @@
 #define C64_BUS_HOLD_CYCLES         10
 #endif
 
+/*
+ * early_commit(): first sample of a write cycle (on a COMMIT_SEL line) passed
+ * to early_commit(). 1 = from the first sample, like the original firmware
+ * (6510 write data is valid ~150 ns after PHI2 rises, a sample takes ~50 ns).
+ */
+#ifndef C64_BUS_EARLY_COMMIT_SAMPLES
+#define C64_BUS_EARLY_COMMIT_SAMPLES   1
+#endif
+
 BUS_INLINE void bus_edge_delay(void) {
    if (C64_BUS_EDGE_DELAY_CYCLES > 0)
       busy_wait_at_least_cycles(C64_BUS_EDGE_DELAY_CYCLES);
@@ -102,12 +122,21 @@ BUS_INLINE bool bus_rom_sel(uint32_t control) {
    return (control & (ROML_MASK|ROMH_MASK)) != (ROML_MASK|ROMH_MASK);
 }
 
+// detect the optional early_commit() method
+template <typename T, typename = void>
+struct bus_has_early_commit : std::false_type {};
+template <typename T>
+struct bus_has_early_commit<T, std::void_t<decltype(&T::early_commit)>> : std::true_type {};
+
 template <typename Cart>
 BUS_INLINE void c64_bus_loop(Cart &cart) {
 
    uint32_t control;
    uint32_t sel_control = 0;
    bool sel_pending;
+
+   // early_commit() state
+   uint32_t early_samples;
 
    SET_DATA_MODE_IN
 
@@ -121,6 +150,7 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
       // CPU phase (PHI2 high)
       //
       sel_pending = false;
+      early_samples = 0;
 
       bus_edge_delay();
 
@@ -133,6 +163,12 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
          if ((control & Cart::COMMIT_SEL) != Cart::COMMIT_SEL) {
             sel_control = control;
             sel_pending = true;
+
+            if constexpr (bus_has_early_commit<Cart>::value) {
+               // write cycle: apply at every sample, the last one wins
+               if (!(control & RW_MASK) && ++early_samples >= C64_BUS_EARLY_COMMIT_SAMPLES)
+                  cart.early_commit(control);
+            }
          }
 
          uint8_t data;

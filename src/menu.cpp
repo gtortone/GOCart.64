@@ -50,6 +50,11 @@ void menu_loop(void) {
 #ifdef DEBUG
          // keep shell alive
          poll_shell();
+
+         // a cartridge started from the shell stops the launcher:
+         // no reply will come, leave the menu
+         if (!launcher_running())
+            return;
 #endif
 
          /*
