@@ -132,6 +132,9 @@ void poll_shell(void) {
                   pattern = token;
             }
             shell_test(pattern, start, clean);
+         } else if (strcmp(token, "cputrace") == 0) {
+            // EasyFlash CPU trace (EF_DEBUG_CPU_TRACE in cartridge.cpp)
+            cpu_trace_shell(strtok(NULL, ""));
          } else if (strcmp(token, "clean") == 0) {
             // power-on like C64 state (RAM, VIC-II, SID cleared)
             // parameter: [on | off]  enable/disable it before every launch,

@@ -11,6 +11,14 @@
 #include "board.h"
 #include "debug.h"
 
+void sync_with_vic(void) {
+   // wait until the raster beam is in the upper or lower border (if VIC-II is enabled)
+   uint32_t control;
+   do {
+      GPIO_GET_LOW_32(control);
+   } while( !(control & BA_MASK) );
+}
+
 void board_setup(void) {
 
    // standard overclock
@@ -99,11 +107,13 @@ void board_setup(void) {
    gpio_init_mask(ADDR_GPIO_MASK | DATA_GPIO_MASK);
    gpio_set_dir_in_masked(ADDR_GPIO_MASK | DATA_GPIO_MASK);
 
-   for(int i=PINROMADDR; i<ADDRWIDTH; i++) {
+   // no pulls on the C64 bus: the RP2350 pads have a pull-down enabled at
+   // reset, which would pull the data bus towards 0 when nobody drives it
+   for(int i=0; i<ADDRWIDTH; i++) {
       gpio_disable_pulls(PINROMADDR+i);
    }
 
-   for(int i=PINROMDATA; i<DATAWIDTH; i++) {
+   for(int i=0; i<DATAWIDTH; i++) {
       gpio_disable_pulls(PINROMDATA+i);
    }
 

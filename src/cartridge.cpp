@@ -13,6 +13,7 @@
 #include "commands.h"
 #include "filesystem.h"
 #include <string.h>
+#include <stdlib.h>     // strtoul
 
 uint8_t crt_buf[CRT_BUFFER_SIZE] = {};
 uint8_t crt_map[EF_MAP_SIZE] = {};
@@ -51,6 +52,89 @@ static volatile uint32_t ef_trace_head;
    } while (0)
 #else
 #define EF_TRACE(reg, data) do { } while (0)
+#endif
+
+/*
+ * EF_DEBUG_CPU_TRACE (needs a DEBUG build)
+ *   1: every C64 cycle of a running EasyFlash cartridge (address, R/W, data,
+ *      select lines, BA) is recorded by core1 in a ring buffer at the end of
+ *      crt_buf, like a logic analyzer. Recording stops CPU_TRACE_POST cycles
+ *      after the CPU reads a trigger address outside the cartridge ROM
+ *      (defaults: see cpu_trace_trig_addr). Consecutive identical cycles
+ *      are recorded once (a JAM does not overwrite the history).
+ *      Shell command: cputrace [dump [n] | trig [w]<addr>[=<data>] ... | stop | run]
+ *   0: disabled
+ */
+#ifndef EF_DEBUG_CPU_TRACE
+#define EF_DEBUG_CPU_TRACE   0
+#endif
+
+#if defined(DEBUG) && EF_DEBUG_CPU_TRACE
+#define CPU_TRACE_ENTRIES   (32 * 1024)                 // 128K, power of 2
+#define CPU_TRACE_BYTES     (CPU_TRACE_ENTRIES * 4)
+#define CPU_TRACE_POST      2048                         // cycles kept after the trigger
+#define CPU_TRACE_TRIGGERS  2
+
+static uint32_t * const cpu_trace_buf = (uint32_t *)(crt_buf + CRT_BUFFER_SIZE - CPU_TRACE_BYTES);
+static volatile bool cpu_trace_on;          // buffer available (cartridge fits)
+static volatile bool cpu_trace_frozen;
+static volatile uint32_t cpu_trace_head;     // entries written
+static volatile uint32_t cpu_trace_post;     // entries left after the trigger, 0 = not triggered
+static volatile uint32_t cpu_trace_trig_at;  // entry index of the trigger
+// triggers: CPU read of an address, optionally with a given data (0x100 = any)
+// defaults: $FE66 KERNAL BRK handler (crash -> "READY"),
+//           $EA31 = $00 KERNAL IRQ entry read from RAM, i.e. a BRK (crash
+//           with the KERNAL banked out -> black screen)
+static volatile uint32_t cpu_trace_trig_addr[CPU_TRACE_TRIGGERS] = { 0xFE66, 0xEA31 };
+static volatile uint32_t cpu_trace_trig_data[CPU_TRACE_TRIGGERS] = { 0x100, 0x00 };
+static volatile bool cpu_trace_trig_write[CPU_TRACE_TRIGGERS] = { false, false };   // write instead of read
+static uint32_t cpu_trace_last;
+
+static void cpu_trace_reset(bool available) {
+   cpu_trace_on = false;
+   cpu_trace_head = 0;
+   cpu_trace_post = 0;
+   cpu_trace_trig_at = 0xFFFFFFFF;
+   cpu_trace_last = 0;
+   cpu_trace_frozen = false;
+   cpu_trace_on = available;
+}
+
+// core1, once per cycle
+static inline __attribute__((always_inline)) void cpu_trace_record(uint32_t control) {
+
+   if (!cpu_trace_on || cpu_trace_frozen || control == cpu_trace_last)
+      return;
+
+   cpu_trace_last = control;
+   uint32_t head = cpu_trace_head;
+   cpu_trace_buf[head & (CPU_TRACE_ENTRIES - 1)] = control;
+   cpu_trace_head = head + 1;
+
+   uint32_t post = cpu_trace_post;
+   if (post) {
+      if (--post == 0)
+         cpu_trace_frozen = true;
+      cpu_trace_post = post;
+   } else if (!bus_rom_sel(control)) {
+      // reads of the cartridge ROM do not trigger (e.g. the EasyFlash boot
+      // code copies $FE00-$FEFF from ROMH in Ultimax mode)
+      uint32_t addr = bus_addr(control);
+      bool write = !(control & RW_MASK);
+      for (int i = 0; i < CPU_TRACE_TRIGGERS; i++) {
+         if (cpu_trace_trig_addr[i] && addr == cpu_trace_trig_addr[i] &&
+             write == cpu_trace_trig_write[i] &&
+             (cpu_trace_trig_data[i] > 0xFF || bus_data(control) == cpu_trace_trig_data[i])) {
+            cpu_trace_trig_at = head;
+            cpu_trace_post = CPU_TRACE_POST;
+            break;
+         }
+      }
+   }
+}
+#define EF_BUF_LIMIT   (CRT_BUFFER_SIZE - (cpu_trace_on ? CPU_TRACE_BYTES : 0))
+#else
+#define EF_BUF_LIMIT   CRT_BUFFER_SIZE
 #endif
 
 
@@ -100,6 +184,13 @@ static void c64_clean_before_start(void) {
 
 static void save_stop(void);
 
+// ROM select lines of a cartridge mode (same arguments as c64_set_exrom_game)
+static uint32_t cart_rom_mask(bool exrom, bool game) {
+   if (!exrom)
+      return game ? (uint32_t)ROML_MASK : (uint32_t)(ROML_MASK | ROMH_MASK);   // 8K / 16K
+   return game ? 0 : (uint32_t)(ROML_MASK | ROMH_MASK);                       // off / Ultimax
+}
+
 static void cart_stop(void) {
 
    // write a pending EasyFlash save before crt_buf is reused
@@ -111,6 +202,9 @@ static void cart_stop(void) {
    c64_set_exrom_game(1, 1);
 
    eapi_active = false;
+#if defined(DEBUG) && EF_DEBUG_CPU_TRACE
+   cpu_trace_reset(false);
+#endif
    ef3_rx_rdy = EF3_NOT_RDY;
    ef3_tx_rdy = EF3_TX_RDY;
    memset(eapi_window, 0, sizeof(eapi_window));
@@ -255,6 +349,7 @@ uint8_t run_rom(uint8_t *rom, uint32_t len) {
    args = {};
    args.crt_buf = crt_buf;
    args.ultimax = exrom && !game;
+   args.rom_mask = cart_rom_mask(exrom, game);
    multicore_launch_core1(run_cart_normal);
    multicore_fifo_push_blocking((uint32_t)&args);
 
@@ -494,7 +589,13 @@ static void easyflash_build_tables(uint8_t chunks) {
 
    uint8_t *blank;
 
-   if ((uint32_t)(chunks + 1) * EF_CHUNK_SIZE <= sizeof(crt_buf)) {
+#if defined(DEBUG) && EF_DEBUG_CPU_TRACE
+   // the CPU trace uses the end of crt_buf, if the cartridge leaves it free
+   cpu_trace_reset((uint32_t)(chunks + 1) * EF_CHUNK_SIZE <= CRT_BUFFER_SIZE - CPU_TRACE_BYTES);
+   printf("EasyFlash: CPU trace %s\n", cpu_trace_on ? "on" : "off (cartridge too large)");
+#endif
+
+   if ((uint32_t)(chunks + 1) * EF_CHUNK_SIZE <= EF_BUF_LIMIT) {
       blank = crt_buf + (uint32_t)chunks * EF_CHUNK_SIZE;
       memset(blank, 0xFF, EF_CHUNK_SIZE);
       ef_next_chunk = chunks + 1;
@@ -554,6 +655,7 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
    args = {};
    args.ultimax = crt->getExrom() && !crt->getGame();
    args.bank_mask = cart_bank_mask(crt->getSize());
+   args.rom_mask = cart_rom_mask(crt->getExrom(), crt->getGame());
 
    printf("\nname: %s\n", crt->getName());
    printf("EXROM: %d, GAME: %d\n", crt->getExrom(), crt->getGame());
@@ -658,6 +760,24 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
 #define CART_METHOD  inline __attribute__((always_inline))
 
 /*
+ * ROM select lines answered by a handler (rom_mask)
+ *
+ * A handler drives the data bus on ROML/ROMH only when the current cartridge
+ * mode maps them: a glitch of ROML/ROMH while the cartridge is off (or of
+ * ROMH in 8K mode) must not drive the bus. Seen on a breadbin with a GAL PLA:
+ * a real ROM/flash ignores pulses shorter than its output enable time, while
+ * the bus loop samples every few tens of ns (random bit errors in RAM while
+ * the program runs with the cartridge off).
+ */
+#define ROM_MASK_16K       (ROML_MASK | ROMH_MASK)
+#define ROM_MASK_8K        ROML_MASK
+#define ROM_MASK_ULTIMAX   (ROML_MASK | ROMH_MASK)
+#define ROM_MASK_OFF       0
+
+// true if one of the enabled ROM select lines is asserted
+#define ROM_SEL(control, mask)   ((~(control)) & (mask))
+
+/*
  * Normal cartridge: 8K, 16K, Ultimax
  */
 struct NormalCart {
@@ -666,9 +786,10 @@ struct NormalCart {
 
    uint8_t *rom;
    bool ultimax;
+   uint32_t rom_mask;      // fixed by the CRT header (8K, 16K, Ultimax)
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
-      if (bus_rom_sel(control)) {
+      if (ROM_SEL(control, rom_mask)) {
          data = rom[bus_addr(control) & 0x3FFF];
          return true;
       }
@@ -687,7 +808,7 @@ struct NormalCart {
 CART_FUNC void __time_critical_func(run_cart_normal)(void) {
 
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
-   NormalCart cart = { p->crt_buf, p->ultimax };
+   NormalCart cart = { p->crt_buf, p->ultimax, p->rom_mask };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -710,9 +831,10 @@ struct MagicDeskCart {
    uint8_t **banks;
    uint8_t *rom_ptr;
    uint32_t bank_mask;
+   uint32_t rom_mask;      // ROML when on, none when off
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
-      if (!(control & ROML_MASK)) {
+      if (ROM_SEL(control, rom_mask)) {
          data = rom_ptr[bus_addr(control) & 0x1FFF];
          return true;
       }
@@ -734,8 +856,10 @@ struct MagicDeskCart {
             rom_ptr = banks[slot] + ((bank & 0x01) ? 0x2000 : 0);
          }
          c64_set_exrom_game(0, 1);     // 8K
+         rom_mask = ROM_MASK_8K;
       } else {
          c64_set_exrom_game(1, 1);     // none
+         rom_mask = ROM_MASK_OFF;
       }
    }
 
@@ -758,7 +882,7 @@ struct MagicDeskCart {
 CART_FUNC void __time_critical_func(run_cart_magic_desk)(void) {
 
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
-   MagicDeskCart cart = { p->crt_banks, p->crt_banks[0], p->bank_mask };
+   MagicDeskCart cart = { p->crt_banks, p->crt_banks[0], p->bank_mask, ROM_MASK_8K };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -779,9 +903,10 @@ struct OceanCart {
 
    uint8_t **banks;
    uint8_t *rom_ptr;
+   uint32_t rom_mask;      // 8K or 16K, from the CRT header
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
-      if (bus_rom_sel(control)) {
+      if (ROM_SEL(control, rom_mask)) {
          data = rom_ptr[bus_addr(control) & 0x3FFF];
          return true;
       }
@@ -801,7 +926,7 @@ struct OceanCart {
 CART_FUNC void __time_critical_func(run_cart_ocean)(void) {
 
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
-   OceanCart cart = { p->crt_banks, p->crt_banks[0] };
+   OceanCart cart = { p->crt_banks, p->crt_banks[0], p->rom_mask };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -822,9 +947,10 @@ struct FunPlayCart {
 
    uint8_t **banks;
    uint8_t *rom_ptr;
+   uint32_t rom_mask;      // ROML when on, none when off
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
-      if (!(control & ROML_MASK)) {
+      if (ROM_SEL(control, rom_mask)) {
          data = rom_ptr[bus_addr(control) & 0x3FFF];
          return true;
       }
@@ -841,8 +967,10 @@ struct FunPlayCart {
       if (!(data & 0x80)) {
          c64_set_exrom_game(0, 1);     // 8K
          rom_ptr = banks[((data >> 3) & 0x07) | ((data & 0x01) << 3)];
+         rom_mask = ROM_MASK_8K;
       } else {
          c64_set_exrom_game(1, 1);     // none
+         rom_mask = ROM_MASK_OFF;
       }
    }
 
@@ -865,7 +993,7 @@ struct FunPlayCart {
 CART_FUNC void __time_critical_func(run_cart_fun_play)(void) {
 
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
-   FunPlayCart cart = { p->crt_banks, p->crt_banks[0] };
+   FunPlayCart cart = { p->crt_banks, p->crt_banks[0], ROM_MASK_8K };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -888,9 +1016,10 @@ struct SuperGamesCart {
    uint8_t **banks;
    uint8_t *rom_ptr;
    bool locked;
+   uint32_t rom_mask;      // ROML+ROMH when on, none when off
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
-      if (bus_rom_sel(control)) {
+      if (ROM_SEL(control, rom_mask)) {
          data = rom_ptr[bus_addr(control) & 0x3FFF];
          return true;
       }
@@ -908,8 +1037,10 @@ struct SuperGamesCart {
 
       if (data & 0x04) {
          c64_set_exrom_game(1, 1);     // none
+         rom_mask = ROM_MASK_OFF;
       } else {
          c64_set_exrom_game(0, 0);     // 16K
+         rom_mask = ROM_MASK_16K;
       }
 
       if (data & 0x08)
@@ -935,7 +1066,7 @@ struct SuperGamesCart {
 CART_FUNC void __time_critical_func(run_cart_super_games)(void) {
 
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
-   SuperGamesCart cart = { p->crt_banks, p->crt_banks[0], false };
+   SuperGamesCart cart = { p->crt_banks, p->crt_banks[0], false, ROM_MASK_16K };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -976,6 +1107,14 @@ static const uint8_t __not_in_flash("ef_mode") ef_mode_table[8] = {
    EF_MODE_16K       // 111
 };
 
+// ROM select lines answered in each mode (EF_MODE_*, see rom_mask)
+static const uint32_t __not_in_flash("ef_mode") ef_rom_mask_table[4] = {
+   ROM_MASK_16K,
+   ROM_MASK_8K,
+   ROM_MASK_ULTIMAX,
+   ROM_MASK_OFF
+};
+
 struct EasyFlashCart {
 
    static constexpr uint32_t COMMIT_SEL = IO1_MASK | IO2_MASK;
@@ -985,10 +1124,11 @@ struct EasyFlashCart {
    uint8_t *roml_ptr;
    uint8_t *romh_ptr;
    bool ultimax;
+   uint32_t rom_mask;      // ROM select lines enabled by the current mode
    uint8_t ram[256];
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
-      if (bus_rom_sel(control)) {
+      if (ROM_SEL(control, rom_mask)) {
          // same latency as a single 16K bank: select ROML/ROMH chunk without branching
          uint8_t *ptr = (control & ROML_MASK) ? romh_ptr : roml_ptr;
          data = ptr[bus_addr(control) & 0x1FFF];
@@ -1047,6 +1187,7 @@ struct EasyFlashCart {
                uint8_t mode = ef_mode_table[data & 0x07];
                c64_set_exrom_game(mode >> 1, mode & 0x01);
                ultimax = (mode == EF_MODE_ULTIMAX);
+               rom_mask = ef_rom_mask_table[mode];
                EF_TRACE(0x02, data);
                break;
             }
@@ -1074,6 +1215,12 @@ struct EasyFlashCart {
       return romh_ptr[addr & 0x1FFF];
    }
 
+#if defined(DEBUG) && EF_DEBUG_CPU_TRACE
+   CART_METHOD void cpu_trace(uint32_t control) {
+      cpu_trace_record(control);
+   }
+#endif
+
 };
 
 CART_FUNC void __time_critical_func(run_cart_easyflash)(void) {
@@ -1081,7 +1228,8 @@ CART_FUNC void __time_critical_func(run_cart_easyflash)(void) {
    /* core1_args_t *p = */ multicore_fifo_pop_blocking();
 
    // EasyFlash boots in Ultimax mode (set by run_cart from CRT header), bank 0
-   EasyFlashCart cart = { ef_roml, ef_romh, ef_roml[0], ef_romh[0], true, {} };
+   EasyFlashCart cart = { ef_roml, ef_romh, ef_roml[0], ef_romh[0], true,
+                          ef_rom_mask_table[EF_MODE_ULTIMAX], {} };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -1270,9 +1418,10 @@ struct CleanCart {
 
    uint8_t *romh;
    bool ultimax;
+   uint32_t rom_mask;      // ROMH in Ultimax mode, none when off
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
-      if (!(control & ROMH_MASK)) {
+      if (ROM_SEL(control, rom_mask)) {
          data = romh[bus_addr(control) & 0x1FFF];
          return true;
       }
@@ -1295,6 +1444,7 @@ struct CleanCart {
          case 0x02:     // $DE02: cartridge off
             c64_set_exrom_game(1, 1);
             ultimax = false;
+            rom_mask = ROM_MASK_OFF;
             break;
       }
    }
@@ -1309,7 +1459,7 @@ struct CleanCart {
 CART_FUNC void __time_critical_func(run_cart_clean)(void) {
 
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
-   CleanCart cart = { p->crt_buf, true };
+   CleanCart cart = { p->crt_buf, true, ROMH_MASK };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -1374,10 +1524,11 @@ struct KffCart {
 
    uint8_t *rom;
    bool ultimax;
+   uint32_t rom_mask;      // Ultimax at boot, then 16K or none ($DE02)
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
 
-      if (bus_rom_sel(control)) {
+      if (ROM_SEL(control, rom_mask)) {
          data = rom[bus_addr(control) & 0x3FFF];
          return true;
       }
@@ -1415,8 +1566,10 @@ struct KffCart {
          case 0x02:     // $DE02 control register
             if (data & 0x01) {
                c64_set_exrom_game(0, 0);     // 16K ROM
+               rom_mask = ROM_MASK_16K;
             } else {
                c64_set_exrom_game(1, 1);     // none
+               rom_mask = ROM_MASK_OFF;
             }
             ultimax = false;
             break;
@@ -1449,7 +1602,7 @@ CART_FUNC void __time_critical_func(run_cart_kff)(void) {
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
 
    // launcher boots in Ultimax mode (see kff_init)
-   KffCart cart = { p->crt_buf, true };
+   KffCart cart = { p->crt_buf, true, ROM_MASK_ULTIMAX };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -1485,10 +1638,11 @@ struct Ef3Cart {
 
    uint8_t *rom;
    bool ultimax;
+   uint32_t rom_mask;      // ROM select lines of the EasyFlash mode
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
 
-      if (bus_rom_sel(control)) {
+      if (ROM_SEL(control, rom_mask)) {
          data = rom[bus_addr(control) & 0x3FFF];
          return true;
       }
@@ -1534,6 +1688,7 @@ struct Ef3Cart {
                uint8_t mode = ef_mode_table[data & 0x07];
                c64_set_exrom_game(mode >> 1, mode & 0x01);
                ultimax = (mode == EF_MODE_ULTIMAX);
+               rom_mask = ef_rom_mask_table[mode];
                break;
             }
 
@@ -1569,7 +1724,7 @@ CART_FUNC void __time_critical_func(run_cart_ef3)(void) {
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
 
    // launcher boots in Ultimax mode
-   Ef3Cart cart = { p->crt_buf, true };
+   Ef3Cart cart = { p->crt_buf, true, ROM_MASK_ULTIMAX };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();
@@ -1729,7 +1884,7 @@ static uint8_t *eapi_get_chunk(uint8_t bank, bool romh) {
    uint8_t *chunk = tab[bank];
 
    if (chunk == ef_blank) {
-      if ((ef_next_chunk + 1) * EF_CHUNK_SIZE > sizeof(crt_buf))
+      if ((ef_next_chunk + 1) * EF_CHUNK_SIZE > EF_BUF_LIMIT)
          return NULL;
       chunk = crt_buf + ef_next_chunk * EF_CHUNK_SIZE;
       ef_next_chunk++;
@@ -1877,3 +2032,124 @@ void cart_poll(void) {
    }
 #endif
 }
+
+#if defined(DEBUG) && EF_DEBUG_CPU_TRACE
+/*
+ * Shell "cputrace" command (EasyFlash CPU trace, see EF_DEBUG_CPU_TRACE)
+ *   cputrace              status
+ *   cputrace dump [n]     print the last n cycles (default 2000), oldest first
+ *   cputrace trig [w]<addr>[=<data>] [[w]<addr>[=<data>]]
+ *                         triggers (hex): read of an address (write with the
+ *                         "w" prefix), optionally only when the data is
+ *                         <data>; "0" = none (stop manually).
+ *                         Default: FE66 EA31=00
+ *   cputrace stop         stop recording now
+ *   cputrace run          clear and record again
+ * Line format: cycle (relative to the trigger or to the last one), address,
+ * R/W, data, then the asserted lines (ROML ROMH IO1 IO2) and "ba" when the
+ * VIC-II requests the bus (BA low).
+ */
+static void cpu_trace_print_triggers(void) {
+   printf("cputrace: triggers");
+   bool any = false;
+   for (int i = 0; i < CPU_TRACE_TRIGGERS; i++) {
+      if (!cpu_trace_trig_addr[i])
+         continue;
+      any = true;
+      printf(" %s$%04lX", cpu_trace_trig_write[i] ? "write " : "", (unsigned long)cpu_trace_trig_addr[i]);
+      if (cpu_trace_trig_data[i] <= 0xFF)
+         printf("=$%02lX", (unsigned long)cpu_trace_trig_data[i]);
+   }
+   printf("%s\n", any ? "" : " none");
+}
+
+void cpu_trace_shell(char *args) {
+
+   char *token = args ? strtok(args, " ") : NULL;
+
+   if (token && strcmp(token, "trig") == 0) {
+      // up to CPU_TRACE_TRIGGERS "<addr>[=<data>]" (hex), "0" = none
+      char *t[CPU_TRACE_TRIGGERS];
+      int n = 0;
+      while (n < CPU_TRACE_TRIGGERS && (t[n] = strtok(NULL, " ")) != NULL)
+         n++;
+      if (n) {
+         for (int i = 0; i < CPU_TRACE_TRIGGERS; i++) {
+            uint32_t addr = 0, data = 0x100;
+            bool write = false;
+            if (i < n) {
+               char *p = t[i], *end;
+               if (*p == 'w' || *p == 'W') {
+                  write = true;
+                  p++;
+               }
+               addr = strtoul(p, &end, 16) & 0xFFFF;
+               if (*end == '=')
+                  data = strtoul(end + 1, NULL, 16) & 0xFF;
+            }
+            cpu_trace_trig_addr[i] = addr;
+            cpu_trace_trig_data[i] = data;
+            cpu_trace_trig_write[i] = write;
+         }
+      }
+      cpu_trace_print_triggers();
+      return;
+   }
+
+   if (token && strcmp(token, "stop") == 0) {
+      cpu_trace_frozen = true;
+      printf("cputrace: stopped\n");
+      return;
+   }
+
+   if (token && strcmp(token, "run") == 0) {
+      bool on = cpu_trace_on;
+      cpu_trace_frozen = true;
+      cpu_trace_reset(on);
+      printf("cputrace: %s\n", on ? "recording" : "not available");
+      return;
+   }
+
+   uint32_t head = cpu_trace_head;
+   uint32_t avail = head < CPU_TRACE_ENTRIES ? head : CPU_TRACE_ENTRIES;
+
+   if (!token || strcmp(token, "dump") != 0) {
+      printf("cputrace: %s, %s, %lu cycles recorded, trigger %s\n",
+             cpu_trace_on ? "available" : "not available",
+             cpu_trace_frozen ? "stopped" : "recording", (unsigned long)avail,
+             cpu_trace_trig_at != 0xFFFFFFFF ? "hit" : "not hit");
+      cpu_trace_print_triggers();
+      return;
+   }
+
+   if (!cpu_trace_frozen) {
+      printf("cputrace: stopped for the dump\n");
+      cpu_trace_frozen = true;
+      head = cpu_trace_head;
+      avail = head < CPU_TRACE_ENTRIES ? head : CPU_TRACE_ENTRIES;
+   }
+
+   uint32_t n = 2000;
+   token = strtok(NULL, " ");
+   if (token)
+      n = strtoul(token, NULL, 10);
+   if (n > avail)
+      n = avail;
+
+   uint32_t ref = (cpu_trace_trig_at != 0xFFFFFFFF) ? cpu_trace_trig_at : head - 1;
+
+   for (uint32_t i = head - n; i != head; i++) {
+      uint32_t c = cpu_trace_buf[i & (CPU_TRACE_ENTRIES - 1)];
+      printf("%+6ld %04lX %c %02X%s%s%s%s%s\n", (long)(i - ref),
+             (unsigned long)bus_addr(c), (c & RW_MASK) ? 'r' : 'W', bus_data(c),
+             (c & ROML_MASK) ? "" : " ROML", (c & ROMH_MASK) ? "" : " ROMH",
+             (c & IO1_MASK) ? "" : " IO1", (c & IO2_MASK) ? "" : " IO2",
+             (c & BA_MASK) ? "" : " ba");
+   }
+}
+#else
+void cpu_trace_shell(char *args) {
+   (void)args;
+   printf("cputrace: not enabled (EF_DEBUG_CPU_TRACE in cartridge.cpp)\n");
+}
+#endif

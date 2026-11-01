@@ -46,6 +46,7 @@ typedef struct {
     uint8_t *crt_map;
     bool ultimax;           // cartridge starts in Ultimax mode (CRT header)
     uint32_t bank_mask;     // 8K bank number bits decoded by the cartridge
+    uint32_t rom_mask;      // ROM select lines answered (see cart_rom_mask)
 } core1_args_t;
 
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
@@ -95,5 +96,8 @@ uint8_t kff_receive_byte(void);
 void kff_send_byte(uint8_t data);
 void kff_init(void);
 void kff_dump(void);
+
+// shell "cputrace" command (EF_DEBUG_CPU_TRACE in cartridge.cpp, DEBUG build)
+void cpu_trace_shell(char *args);
 
 #endif

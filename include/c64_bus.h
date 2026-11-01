@@ -58,7 +58,11 @@
  *       raised by the C64 pull-ups, which takes time. The first samples may
  *       carry a value that is not valid yet: it is overwritten by the next
  *       ones. commit() is still called at the end of the cycle.
-
+ *
+ *   void cpu_trace(uint32_t control)   (optional, debug)
+ *       called once per cycle on the PHI2 falling edge, after commit(), with
+ *       the last CPU-phase sample of every cycle (selected or not): address,
+ *       R/W, select lines, BA and the data bus as seen by the C64
  */
 
 #define BUS_INLINE   static inline __attribute__((always_inline))
@@ -128,12 +132,21 @@ struct bus_has_early_commit : std::false_type {};
 template <typename T>
 struct bus_has_early_commit<T, std::void_t<decltype(&T::early_commit)>> : std::true_type {};
 
+// detect the optional cpu_trace() method
+template <typename T, typename = void>
+struct bus_has_cpu_trace : std::false_type {};
+template <typename T>
+struct bus_has_cpu_trace<T, std::void_t<decltype(&T::cpu_trace)>> : std::true_type {};
+
 template <typename Cart>
 BUS_INLINE void c64_bus_loop(Cart &cart) {
 
    uint32_t control;
    uint32_t sel_control = 0;
    bool sel_pending;
+
+   // cpu_trace() state: last sample with PHI2 high
+   uint32_t cpu_last = 0;
 
    // early_commit() state
    uint32_t early_samples;
@@ -159,6 +172,9 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
          GPIO_GET_LOW_32(control);
          if (!(control & PHI2_MASK))
             break;
+
+         if constexpr (bus_has_cpu_trace<Cart>::value)
+            cpu_last = control;
 
          if ((control & Cart::COMMIT_SEL) != Cart::COMMIT_SEL) {
             sel_control = control;
@@ -187,6 +203,9 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
       //
       if (sel_pending)
          cart.commit(sel_control);
+
+      if constexpr (bus_has_cpu_trace<Cart>::value)
+         cart.cpu_trace(cpu_last);
 
       //
       // VIC-II phase (PHI2 low)
