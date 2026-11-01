@@ -677,7 +677,7 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
 
       case 5:
          // Ocean (5)
-         args.crt_banks = crt_banks;
+         args.crt_buf = crt_buf;
          printf("cart: Ocean\n");
          multicore_launch_core1(run_cart_ocean);
          multicore_fifo_push_blocking((uint32_t)&args);
@@ -895,19 +895,22 @@ CART_FUNC void __time_critical_func(run_cart_magic_desk)(void) {
 /*
  * Ocean (5)
  *
- * $DE00 write: 16K slot (ROML bank n, ROMH bank n+16)
+ * $DE00 write: 8K bank (bits 0-5, unused bits not decoded), mapped at both
+ * ROML and ROMH (16K mode) like VICE; 8K mode for small images (see CRTParser)
+ * 8K banks are packed in crt_buf: bank n at crt_buf + n * 8K
  */
 struct OceanCart {
 
    static constexpr uint32_t COMMIT_SEL = IO1_MASK;
 
-   uint8_t **banks;
+   uint8_t *rom;
    uint8_t *rom_ptr;
-   uint32_t rom_mask;      // 8K or 16K, from the CRT header
+   uint32_t bank_mask;
+   uint32_t rom_mask;      // 8K or 16K, see CRTParser
 
    CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
       if (ROM_SEL(control, rom_mask)) {
-         data = rom_ptr[bus_addr(control) & 0x3FFF];
+         data = rom_ptr[bus_addr(control) & 0x1FFF];
          return true;
       }
       return false;
@@ -915,7 +918,7 @@ struct OceanCart {
 
    CART_METHOD void commit(uint32_t control) {
       if (!(control & RW_MASK) && (bus_addr(control) == 0xDE00))
-         rom_ptr = banks[bus_data(control) % 16];
+         rom_ptr = rom + ((uint32_t)(bus_data(control) & 0x3F & bank_mask) << 13);
    }
 
    CART_METHOD bool vic_enabled(void) { return false; }
@@ -926,7 +929,7 @@ struct OceanCart {
 CART_FUNC void __time_critical_func(run_cart_ocean)(void) {
 
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
-   OceanCart cart = { p->crt_banks, p->crt_banks[0], p->rom_mask };
+   OceanCart cart = { p->crt_buf, p->crt_buf, p->bank_mask, p->rom_mask };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();

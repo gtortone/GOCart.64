@@ -66,11 +66,12 @@ public:
          else return false;
       }
 
-      // Ocean: the header is often wrong. 128K/256K images also have ROMH
-      // chips and need 16K mode, smaller ones (e.g. Wonderboy) are 8K
+      // Ocean: the header is often wrong. Images with ROMH chips or larger
+      // than 128K (256K, e.g. SCI) need 16K mode, the others (e.g.
+      // Wonderboy) are 8K
       if (type == 5) {
          exrom = 0;
-         game = has_romh ? 0 : 1;
+         game = (has_romh || size > 128*1024) ? 0 : 1;
       }
 
       return true;
@@ -186,6 +187,13 @@ private:
          return NEXT_CHIP;
       }
 
+      if (type == 5) {
+         if (!parseOceanChip(number, startAddr, blockLen))
+            return false;
+         addChip(chipType, number, startAddr, blockLen);
+         return NEXT_CHIP;
+      }
+
       // calculate offset inside memory buffer
       uint32_t ofs = 0;
 
@@ -221,13 +229,7 @@ private:
       } else if((startAddr == 0xa000 || startAddr == 0xe000) && blockLen <= 8*1024 ) {
 
          has_romh = true;
-
-         if (type == 5) {
-            // Ocean
-            ofs = (number % 16) * 16*1024 + 8*1024;
-         } else {
-            ofs = number * 16*1024 + 8*1024;
-         }
+         ofs = number * 16*1024 + 8*1024;
 
       } else if(startAddr == 0xf000 && blockLen <= 4*1024 ) {
 
@@ -262,6 +264,34 @@ private:
       (void)startAddr;
       chip_count++;
       size += blockLen;
+   }
+
+   /*
+    * Ocean
+    *
+    * One bank register ($DE00) selects an 8K bank, mapped at both ROML and
+    * ROMH (like VICE). The chips are placed by bank number: the load address
+    * in the CRT is not meaningful (256K images have banks 16-31 either at
+    * $8000 or at $A000). Bank n is at crt_buf + n * 8K.
+    */
+   bool parseOceanChip(uint8_t number, uint16_t startAddr, uint16_t blockLen) {
+
+      if (blockLen != 8*1024 || number >= 64 ||
+          (startAddr != 0x8000 && startAddr != 0xA000)) {
+         printf("E: Ocean chip not supported (bank %d, $%04X, %d bytes)\n", number, startAddr, blockLen);
+         return false;
+      }
+
+      if (startAddr == 0xA000)
+         has_romh = true;
+
+      uint32_t ofs = (uint32_t)number * 8*1024;
+      if (ofs + blockLen > crt_buf_size) {
+         printf("E: CRT too large for buffer (bank %d, offset %lu)\n", number, (unsigned long)ofs);
+         return false;
+      }
+
+      return reader.read(crt_buf + ofs, blockLen);
    }
 
    /*
