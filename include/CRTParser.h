@@ -46,6 +46,11 @@ public:
       return game;
    }
 
+   // hardware subtype (CRT version 1.1+), e.g. RGCD: 0 RGCD, 1 Hucky
+   uint8_t getSubtype(void) {
+      return subtype;
+   }
+
    uint32_t getSize(void) {
       return size;
    }
@@ -90,6 +95,7 @@ private:
    IDataReader& reader;
 
    uint16_t type;
+   uint8_t subtype = 0;
    bool exrom, game;
    char name[33];
    uint32_t size = 0;
@@ -118,9 +124,10 @@ private:
       if (memcmp(buf, "C64 CARTRIDGE   ", 16) != 0)
          return false;
 
-      // skip file header length and cartridge version
+      // file header length, cartridge version
       if(!reader.read(buf, 6))
          return false;
+      uint16_t version = (buf[4] << 8) | buf[5];
 
       if(!reader.read(buf, 2))
          return false;
@@ -142,11 +149,20 @@ private:
       } else if(type == 18) {
          // Zaxxon: always 16K mode
          exrom = game = 0;
+      } else if(type == 15 || type == 43 || type == 57 || type == 12) {
+         // C64 Game System, Prophet64, RGCD, Rex Utility: 8K mode
+         exrom = 0;
+         game = 1;
+      } else if(type == 11 || type == 13 || type == 16 || type == 21) {
+         // Westermann, Final Cartridge I, Warp Speed, Comal-80: 16K mode
+         exrom = game = 0;
       }
-      
-      // skip reserved bytes
+
+      // reserved bytes, the first one is the hardware subtype (CRT 1.1+)
       if(!reader.read(buf, 6))
          return false;
+      if (version >= 0x0101)
+         subtype = buf[0];
 
       if(!reader.read(buf, 32))
          return false;
@@ -189,6 +205,23 @@ private:
 
       if (type == 5) {
          if (!parseOceanChip(number, startAddr, blockLen))
+            return false;
+         addChip(chipType, number, startAddr, blockLen);
+         return NEXT_CHIP;
+      }
+
+      // C64 Game System: up to 64 banks of 8K (512K), packed (see parse8KPackedChip)
+      if (type == 15) {
+         if (!parse8KPackedChip(number, startAddr, blockLen))
+            return false;
+         addChip(chipType, number, startAddr, blockLen);
+         return NEXT_CHIP;
+      }
+
+      // 8K banks selected by a register: Prophet64 (32), RGCD/Hucky (8)
+      if (type == 43 || type == 57) {
+         uint8_t max_banks = (type == 43) ? 32 : 8;
+         if (!parse8KBankChip(number, startAddr, blockLen, max_banks))
             return false;
          addChip(chipType, number, startAddr, blockLen);
          return NEXT_CHIP;
@@ -292,6 +325,92 @@ private:
       }
 
       return reader.read(crt_buf + ofs, blockLen);
+   }
+
+   /*
+    * Cartridges with 8K banks at ROML selected by a register (C64 Game System,
+    * Prophet64, RGCD): bank n at crt_buf + n * 8K. The load address in the
+    * CRT is not meaningful (RGCD images use $8000 or $A000).
+    */
+   bool parse8KBankChip(uint8_t number, uint16_t startAddr, uint16_t blockLen, uint8_t max_banks) {
+
+      if (blockLen != 8*1024 || number >= max_banks ||
+          (startAddr != 0x8000 && startAddr != 0xA000)) {
+         printf("E: chip not supported (bank %d, $%04X, %d bytes)\n", number, startAddr, blockLen);
+         return false;
+      }
+
+      uint32_t ofs = (uint32_t)number * 8*1024;
+      if (ofs + blockLen > crt_buf_size) {
+         printf("E: CRT too large for buffer (bank %d, offset %lu)\n", number, (unsigned long)ofs);
+         return false;
+      }
+
+      return reader.read(crt_buf + ofs, blockLen);
+   }
+
+   /*
+    * Cartridges with up to 64 banks of 8K at ROML (C64 Game System, 512K
+    * images): the chips are packed as 8K chunks like EasyFlash ROML, so that
+    * images padded with erased or repeated banks fit in crt_buf.
+    *   crt_map[bank] -> chunk index (crt_buf + n * 8K), EF_CHUNK_NONE: erased
+    * An erased (all $FF) bank takes no chunk, a bank equal to a previous one
+    * shares its chunk. getEasyFlashChunks() returns the chunks used.
+    */
+   bool parse8KPackedChip(uint8_t number, uint16_t startAddr, uint16_t blockLen) {
+
+      if (blockLen != 8*1024 || number >= EF_BANKS ||
+          (startAddr != 0x8000 && startAddr != 0xA000) || crt_map_size < EF_BANKS) {
+         printf("E: chip not supported (bank %d, $%04X, %d bytes)\n", number, startAddr, blockLen);
+         return false;
+      }
+
+      if (!ef_init) {
+         memset(crt_map, EF_CHUNK_NONE, EF_BANKS);
+         ef_chunks = 0;
+         ef_init = true;
+      }
+
+      // buffer full: only an erased bank can still be accepted
+      if ((uint32_t)(ef_chunks + 1) * EF_CHUNK_SIZE > crt_buf_size) {
+         uint8_t part[64];
+         for (uint16_t ofs = 0; ofs < blockLen; ofs += sizeof(part)) {
+            if (!reader.read(part, sizeof(part)))
+               return false;
+            for (uint8_t i = 0; i < sizeof(part); i++) {
+               if (part[i] != 0xFF) {
+                  printf("E: CRT too large for buffer (bank %d)\n", number);
+                  return false;
+               }
+            }
+         }
+         crt_map[number] = EF_CHUNK_NONE;
+         return true;
+      }
+
+      uint8_t *dst = crt_buf + (uint32_t)ef_chunks * EF_CHUNK_SIZE;
+      if (!reader.read(dst, blockLen))
+         return false;
+
+      // erased bank
+      uint16_t i = 0;
+      while (i < blockLen && dst[i] == 0xFF)
+         i++;
+      if (i == blockLen) {
+         crt_map[number] = EF_CHUNK_NONE;
+         return true;
+      }
+
+      // same data as a previous bank
+      for (uint8_t c = 0; c < ef_chunks; c++) {
+         if (memcmp(crt_buf + (uint32_t)c * EF_CHUNK_SIZE, dst, blockLen) == 0) {
+            crt_map[number] = c;
+            return true;
+         }
+      }
+
+      crt_map[number] = ef_chunks++;
+      return true;
    }
 
    /*

@@ -423,6 +423,32 @@ static void easyflash_build_tables(uint8_t chunks) {
    }
 }
 
+// C64 Game System: bank pointers from the chunk map built by CRTParser.
+// Erased or missing banks point to an erased chunk.
+static void c64gs_build_table(uint8_t chunks) {
+
+   uint8_t *blank = NULL;
+   if ((uint32_t)(chunks + 1) * EF_CHUNK_SIZE <= sizeof(crt_buf)) {
+      blank = crt_buf + (uint32_t)chunks * EF_CHUNK_SIZE;
+      memset(blank, 0xFF, EF_CHUNK_SIZE);
+   }
+
+   uint8_t erased = 0;
+   for (int bank = 0; bank < EF_BANKS; bank++) {
+      uint8_t c = crt_map[bank];
+      if (c == EF_CHUNK_NONE) {
+         erased++;
+         // no room for an erased chunk: the buffer is full of unique banks
+         ef_roml[bank] = blank ? blank : crt_buf;
+      } else {
+         ef_roml[bank] = crt_buf + (uint32_t)c * EF_CHUNK_SIZE;
+      }
+   }
+
+   printf("C64GS: %d chunks (8K) used, %d erased banks%s\n", chunks, erased,
+          (erased && !blank) ? " (W: no erased chunk)" : "");
+}
+
 uint8_t run_cart(IDataReader &r, const char *file_name) {
 
    c64_clean_before_start();
@@ -514,6 +540,79 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
          multicore_fifo_push_blocking((uint32_t)&args);
          break;
 
+      case 4:
+         // Simons' BASIC (4)
+         args.crt_buf = crt_buf;
+         printf("cart: Simons' BASIC\n");
+         multicore_launch_core1(run_cart_simons_basic);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
+      case 11:
+         // Westermann Learning (11)
+         args.crt_buf = crt_buf;
+         printf("cart: Westermann Learning\n");
+         multicore_launch_core1(run_cart_westermann);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
+      case 12:
+         // Rex Utility (12)
+         args.crt_buf = crt_buf;
+         printf("cart: Rex Utility\n");
+         multicore_launch_core1(run_cart_rex_utility);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
+      case 13:
+         // Final Cartridge I (13)
+         args.crt_buf = crt_buf;
+         printf("cart: Final Cartridge I\n");
+         multicore_launch_core1(run_cart_final_i);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
+      case 15:
+         // C64 Game System, System 3 (15)
+         c64gs_build_table(crt->getEasyFlashChunks());
+         printf("cart: C64 Game System\n");
+         multicore_launch_core1(run_cart_c64gs);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
+      case 16:
+         // Warp Speed (16)
+         args.crt_buf = crt_buf;
+         printf("cart: Warp Speed\n");
+         multicore_launch_core1(run_cart_warp_speed);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
+      case 21:
+         // Comal-80 (21)
+         args.crt_banks = crt_banks;
+         printf("cart: Comal-80\n");
+         multicore_launch_core1(run_cart_comal80);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
+      case 43:
+         // Prophet64 (43)
+         args.crt_buf = crt_buf;
+         printf("cart: Prophet64\n");
+         multicore_launch_core1(run_cart_prophet64);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
+      case 57:
+         // RGCD, Hucky (57)
+         args.crt_buf = crt_buf;
+         args.subtype = crt->getSubtype();
+         printf("cart: %s\n", args.subtype == 1 ? "Hucky" : "RGCD");
+         multicore_launch_core1(run_cart_rgcd);
+         multicore_fifo_push_blocking((uint32_t)&args);
+         break;
+
       case 32:
          // EasyFlash (32)
          easyflash_build_tables(crt->getEasyFlashChunks());
@@ -551,6 +650,15 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
 #define CART_METHOD  inline __attribute__((always_inline))
 
 /*
+ * Handler code runs on core1 from RAM (__time_critical_func): a flash (XIP)
+ * cache miss would stall the bus loop. Main RAM is almost full (DEBUG build),
+ * so some handlers are placed in the 4K scratch banks, which only hold the
+ * core stacks (2K each): SCRATCH_X (core1 stack) and SCRATCH_Y (core0 stack).
+ */
+#define CART_IN_SCRATCH_X(name)   __scratch_x(#name) name
+#define CART_IN_SCRATCH_Y(name)   __scratch_y(#name) name
+
+/*
  * ROM select lines answered by a handler (rom_mask)
  *
  * A handler drives the data bus on ROML/ROMH only when the current cartridge
@@ -567,6 +675,12 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
 
 // true if one of the enabled ROM select lines is asserted
 #define ROM_SEL(control, mask)   ((~(control)) & (mask))
+
+// ROM select lines of a cartridge mode (same arguments as c64_set_exrom_game),
+// for the core1 handlers (inline: no flash access)
+static inline __attribute__((always_inline)) uint32_t rom_mask_of(bool exrom, bool game) {
+   return exrom ? (game ? ROM_MASK_OFF : ROM_MASK_ULTIMAX) : (game ? ROM_MASK_8K : ROM_MASK_16K);
+}
 
 /*
  * Normal cartridge: 8K, 16K, Ultimax
@@ -1115,6 +1229,521 @@ CART_FUNC void __time_critical_func(run_cart_zaxxon)(void) {
 
    core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
    ZaxxonCart cart = { p->crt_banks, p->crt_banks[0], p->crt_banks[0] };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * C64 Game System, System 3 (15)
+ *
+ * up to 64 banks of 8K at ROML (8K mode), packed in crt_buf: bank pointers in
+ * the EasyFlash ROML table (see CRTParser::parse8KPackedChip)
+ * any access (read or write) to $DE00-$DEFF: bank = A0-A5
+ */
+struct C64GsCart {
+
+   static constexpr uint32_t COMMIT_SEL = IO1_MASK;
+
+   uint8_t * const *banks;
+   uint8_t *rom_ptr;
+   uint32_t bank_mask;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, ROM_MASK_8K)) {
+         data = rom_ptr[bus_addr(control) & 0x1FFF];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      rom_ptr = banks[bus_addr(control) & 0x3F & bank_mask];
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_X(run_cart_c64gs)(void) {
+
+   /* core1_args_t *p = */ multicore_fifo_pop_blocking();
+   C64GsCart cart = { ef_roml, ef_roml[0], EF_BANKS - 1 };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * Prophet64 (43)
+ *
+ * 8K banks at ROML (8K mode), up to 32 (crt_buf + n * 8K)
+ * $DF00-$DFFF write: bit 0-4 = bank, bit 5 = 1 cartridge disabled
+ */
+struct Prophet64Cart {
+
+   static constexpr uint32_t COMMIT_SEL = IO2_MASK;
+
+   uint8_t *rom;
+   uint8_t *rom_ptr;
+   uint32_t bank_mask;
+   uint32_t rom_mask;      // ROML when on, none when off
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, rom_mask)) {
+         data = rom_ptr[bus_addr(control) & 0x1FFF];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      if (control & RW_MASK)
+         return;
+      uint8_t data = bus_data(control);
+      rom_ptr = rom + ((data & 0x1F & bank_mask) << 13);
+      if (data & 0x20) {
+         c64_set_exrom_game(1, 1);     // none
+         rom_mask = ROM_MASK_OFF;
+      } else {
+         c64_set_exrom_game(0, 1);     // 8K
+         rom_mask = ROM_MASK_8K;
+      }
+   }
+
+   // cartridge on/off takes effect during the write cycle (see c64_bus.h)
+   CART_METHOD void early_commit(uint32_t control) {
+      if (bus_data(control) & 0x20)
+         c64_set_exrom_game(1, 1);
+      else
+         c64_set_exrom_game(0, 1);
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_X(run_cart_prophet64)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   Prophet64Cart cart = { p->crt_buf, p->crt_buf, p->bank_mask, ROM_MASK_8K };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * RGCD, Hucky (57)
+ *
+ * 8K banks at ROML (8K mode), up to 8 (crt_buf + n * 8K)
+ * $DE00-$DEFF write: bit 0-2 = bank (inverted on Hucky, subtype 1),
+ *                    bit 3 = 1 cartridge disabled until reset
+ */
+struct RgcdCart {
+
+   static constexpr uint32_t COMMIT_SEL = IO1_MASK;
+
+   uint8_t *rom;
+   uint8_t *rom_ptr;
+   uint32_t bank_mask;
+   uint32_t rom_mask;      // ROML when on, none when disabled
+   uint8_t bank_xor;       // 7 on Hucky
+   bool disabled;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, rom_mask)) {
+         data = rom_ptr[bus_addr(control) & 0x1FFF];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      if ((control & RW_MASK) || disabled)
+         return;
+      uint8_t data = bus_data(control);
+      if (data & 0x08) {
+         c64_set_exrom_game(1, 1);     // none, until reset
+         rom_mask = ROM_MASK_OFF;
+         disabled = true;
+      } else {
+         rom_ptr = rom + (((data ^ bank_xor) & 0x07 & bank_mask) << 13);
+      }
+   }
+
+   CART_METHOD void early_commit(uint32_t control) {
+      if (!disabled && (bus_data(control) & 0x08))
+         c64_set_exrom_game(1, 1);
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_Y(run_cart_rgcd)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   uint8_t bank_xor = (p->subtype == 1) ? 0x07 : 0x00;
+   // bank 0 selected at reset (bank 7 of the image on Hucky)
+   RgcdCart cart = { p->crt_buf, p->crt_buf + ((bank_xor & p->bank_mask) << 13),
+                     p->bank_mask, ROM_MASK_8K, bank_xor, false };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * Comal-80 (21)
+ *
+ * 16K banks, up to 8 (crt_banks)
+ * $DE00-$DEFF write: bit 0-2 = bank, bit 5-7 = mode:
+ *   $E0: cartridge off, $40: 8K, $80 and others: 16K
+ */
+struct Comal80Cart {
+
+   static constexpr uint32_t COMMIT_SEL = IO1_MASK;
+
+   uint8_t **banks;
+   uint8_t *rom_ptr;
+   uint32_t rom_mask;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, rom_mask)) {
+         data = rom_ptr[bus_addr(control) & 0x3FFF];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void set_mode(uint8_t data) {
+      switch (data & 0xE0) {
+         case 0xE0:
+            c64_set_exrom_game(1, 1);     // none
+            rom_mask = ROM_MASK_OFF;
+            break;
+         case 0x40:
+            c64_set_exrom_game(0, 1);     // 8K
+            rom_mask = ROM_MASK_8K;
+            break;
+         default:
+            c64_set_exrom_game(0, 0);     // 16K
+            rom_mask = ROM_MASK_16K;
+            break;
+      }
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      if (control & RW_MASK)
+         return;
+      uint8_t data = bus_data(control);
+      rom_ptr = banks[data & 0x07];
+      set_mode(data);
+   }
+
+   CART_METHOD void early_commit(uint32_t control) {
+      set_mode(bus_data(control));
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_Y(run_cart_comal80)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   Comal80Cart cart = { p->crt_banks, p->crt_banks[0], ROM_MASK_16K };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * Westermann Learning (11)
+ *
+ * 16K, starts in 16K mode
+ * $DF00-$DFFF read: 8K mode
+ */
+struct WestermannCart {
+
+   static constexpr uint32_t COMMIT_SEL = IO2_MASK;
+
+   uint8_t *rom;
+   uint32_t rom_mask;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, rom_mask)) {
+         data = rom[bus_addr(control) & 0x3FFF];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      if (control & RW_MASK) {
+         c64_set_exrom_game(0, 1);     // 8K
+         rom_mask = ROM_MASK_8K;
+      }
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_X(run_cart_westermann)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   WestermannCart cart = { p->crt_buf, ROM_MASK_16K };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * Simons' BASIC (4)
+ *
+ * 16K, starts in the mode of the CRT header
+ * $DE00-$DEFF read: 8K mode, write: 16K mode
+ */
+struct SimonsBasicCart {
+
+   static constexpr uint32_t COMMIT_SEL = IO1_MASK;
+
+   uint8_t *rom;
+   uint32_t rom_mask;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, rom_mask)) {
+         data = rom[bus_addr(control) & 0x3FFF];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      if (control & RW_MASK) {
+         c64_set_exrom_game(0, 1);     // 8K
+         rom_mask = ROM_MASK_8K;
+      } else {
+         c64_set_exrom_game(0, 0);     // 16K
+         rom_mask = ROM_MASK_16K;
+      }
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_X(run_cart_simons_basic)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   SimonsBasicCart cart = { p->crt_buf, p->rom_mask };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * Rex Utility (12)
+ *
+ * 8K at ROML, starts enabled
+ * $DF00-$DFBF read: cartridge off, $DFC0-$DFFF read: cartridge on
+ */
+struct RexUtilityCart {
+
+   static constexpr uint32_t COMMIT_SEL = IO2_MASK;
+
+   uint8_t *rom;
+   uint32_t rom_mask;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, rom_mask)) {
+         data = rom[bus_addr(control) & 0x1FFF];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      if (!(control & RW_MASK))
+         return;
+      if ((bus_addr(control) & 0xC0) == 0xC0) {
+         c64_set_exrom_game(0, 1);     // 8K
+         rom_mask = ROM_MASK_8K;
+      } else {
+         c64_set_exrom_game(1, 1);     // none
+         rom_mask = ROM_MASK_OFF;
+      }
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_X(run_cart_rex_utility)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   RexUtilityCart cart = { p->crt_buf, ROM_MASK_8K };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * Final Cartridge I (13)
+ *
+ * 16K, starts in 16K mode
+ * $DE00-$DEFF access (read or write): cartridge off
+ * $DF00-$DFFF access (read or write): 16K mode
+ * $DE00-$DEFF / $DF00-$DFFF read: ROM $1E00-$1EFF / $1F00-$1FFF (also when off)
+ */
+struct FinalICart {
+
+   static constexpr uint32_t COMMIT_SEL = IO1_MASK | IO2_MASK;
+
+   uint8_t *rom;
+   uint32_t rom_mask;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, rom_mask)) {
+         data = rom[bus_addr(control) & 0x3FFF];
+         return true;
+      }
+      if (!(control & IO1_MASK)) {
+         data = rom[0x1E00 | (bus_addr(control) & 0xFF)];
+         return true;
+      }
+      if (!(control & IO2_MASK)) {
+         data = rom[0x1F00 | (bus_addr(control) & 0xFF)];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void set_mode(uint32_t control) {
+      if (!(control & IO1_MASK)) {
+         c64_set_exrom_game(1, 1);     // none
+         rom_mask = ROM_MASK_OFF;
+      } else {
+         c64_set_exrom_game(0, 0);     // 16K
+         rom_mask = ROM_MASK_16K;
+      }
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      set_mode(control);
+   }
+
+   CART_METHOD void early_commit(uint32_t control) {
+      set_mode(control);
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_X(run_cart_final_i)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   FinalICart cart = { p->crt_buf, ROM_MASK_16K };
+
+   c64_reset();
+   /* uint32_t irqstatus = */ save_and_disable_interrupts();
+
+   c64_bus_loop(cart);
+}
+
+//
+
+/*
+ * Warp Speed (16)
+ *
+ * 16K, starts in 16K mode
+ * $DE00-$DEFF write: 16K mode, $DF00-$DFFF write: cartridge off
+ * $DE00-$DEFF / $DF00-$DFFF read: ROM $1E00-$1EFF / $1F00-$1FFF (also when off)
+ */
+struct WarpSpeedCart {
+
+   static constexpr uint32_t COMMIT_SEL = IO1_MASK | IO2_MASK;
+
+   uint8_t *rom;
+   uint32_t rom_mask;
+
+   CART_METHOD bool cpu_read(uint32_t control, uint8_t &data) {
+      if (ROM_SEL(control, rom_mask) || (control & (IO1_MASK | IO2_MASK)) != (IO1_MASK | IO2_MASK)) {
+         data = rom[bus_addr(control) & 0x3FFF];
+         return true;
+      }
+      return false;
+   }
+
+   CART_METHOD void set_mode(uint32_t control) {
+      if (!(control & IO1_MASK)) {
+         c64_set_exrom_game(0, 0);     // 16K
+         rom_mask = ROM_MASK_16K;
+      } else {
+         c64_set_exrom_game(1, 1);     // none
+         rom_mask = ROM_MASK_OFF;
+      }
+   }
+
+   CART_METHOD void commit(uint32_t control) {
+      if (!(control & RW_MASK))
+         set_mode(control);
+   }
+
+   CART_METHOD void early_commit(uint32_t control) {
+      set_mode(control);
+   }
+
+   CART_METHOD bool vic_enabled(void) { return false; }
+
+   CART_METHOD uint8_t vic_read(uint32_t addr) { (void)addr; return 0; }
+};
+
+CART_FUNC void CART_IN_SCRATCH_X(run_cart_warp_speed)(void) {
+
+   core1_args_t *p = (core1_args_t*) multicore_fifo_pop_blocking();
+   WarpSpeedCart cart = { p->crt_buf, ROM_MASK_16K };
 
    c64_reset();
    /* uint32_t irqstatus = */ save_and_disable_interrupts();

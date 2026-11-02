@@ -47,6 +47,7 @@ typedef struct {
     bool ultimax;           // cartridge starts in Ultimax mode (CRT header)
     uint32_t bank_mask;     // 8K bank number bits decoded by the cartridge
     uint32_t rom_mask;      // ROM select lines answered (see cart_rom_mask)
+    uint8_t subtype;        // hardware subtype (CRT header), e.g. RGCD/Hucky
 } core1_args_t;
 
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
@@ -87,6 +88,15 @@ void run_cart_super_games(void);
 void run_cart_easyflash(void);
 void run_cart_dinamic(void);
 void run_cart_zaxxon(void);
+void run_cart_simons_basic(void);
+void run_cart_westermann(void);
+void run_cart_rex_utility(void);
+void run_cart_final_i(void);
+void run_cart_c64gs(void);
+void run_cart_warp_speed(void);
+void run_cart_comal80(void);
+void run_cart_prophet64(void);
+void run_cart_rgcd(void);
 void run_cart_kff(void);
 void run_cart_ef3(void);
 
