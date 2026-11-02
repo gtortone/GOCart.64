@@ -20,9 +20,14 @@
  *
  *  - commit (PHI2 falling edge): side effects (register writes, bank switching
  *    on read, pointer increments) are applied once per cycle, using the last
- *    CPU-phase sample. 6510 write data becomes valid well after PHI2 rises, so
+ *    CPU-phase sample with a select line (see C64_BUS_COMMIT_MIN_SAMPLES). 6510 write data becomes valid well after PHI2 rises, so
  *    the last sample is the only reliable one. This is also when the real
  *    cartridges latch their registers.
+ *    A read cycle with BA low is not committed (C64_BUS_BA_READ_FILTER): the
+ *    VIC-II requested the bus, RDY (= BA) is low and the 6510 stops on that
+ *    read and repeats it until BA is high again. Only the last read is used
+ *    by the CPU, so read side effects (FIFO pointers, "data consumed" flags)
+ *    must be applied once, on the read with BA high. Writes are not repeated.
  *
  *  - VIC-II phase (PHI2 low): only in Ultimax mode the VIC-II sees ROMH at
  *    $3000-$3FFF of every VIC bank (A12-A15 pulled up -> cartridge sees $Fxxx).
@@ -101,6 +106,31 @@
 #define C64_BUS_EARLY_COMMIT_SAMPLES   1
 #endif
 
+/*
+ * C64_BUS_COMMIT_MIN_SAMPLES
+ *   commit() is called only if a COMMIT_SEL line was asserted in at least
+ *   this number of consecutive samples, with the last of those samples.
+ *   A select line asserted for a single sample is a glitch of the PLA while
+ *   the address changes (seen on a breadbin with a GAL PLA: a second commit
+ *   of a $DE0A read lost a byte). A real access lasts for most of the phase.
+ *   The select line is not required at the very end of the phase: on a C64C
+ *   IO1 is released before PHI2 falls as seen on the expansion port.
+ *   1: no filter
+ */
+#ifndef C64_BUS_COMMIT_MIN_SAMPLES
+#define C64_BUS_COMMIT_MIN_SAMPLES   2
+#endif
+
+/*
+ * C64_BUS_BA_READ_FILTER
+ *   1: read cycles with BA low are not passed to commit() (see above)
+ *   0: every read cycle is committed (repeated reads apply side effects
+ *      more than once)
+ */
+#ifndef C64_BUS_BA_READ_FILTER
+#define C64_BUS_BA_READ_FILTER   1
+#endif
+
 BUS_INLINE void bus_edge_delay(void) {
    if (C64_BUS_EDGE_DELAY_CYCLES > 0)
       busy_wait_at_least_cycles(C64_BUS_EDGE_DELAY_CYCLES);
@@ -145,8 +175,11 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
    uint32_t sel_control = 0;
    bool sel_pending;
 
-   // cpu_trace() state: last sample with PHI2 high
+   // last sample with PHI2 high (cpu_trace)
    uint32_t cpu_last = 0;
+
+   // consecutive samples with a COMMIT_SEL line asserted
+   uint32_t sel_samples;
 
    // early_commit() state
    uint32_t early_samples;
@@ -163,6 +196,7 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
       // CPU phase (PHI2 high)
       //
       sel_pending = false;
+      sel_samples = 0;
       early_samples = 0;
 
       bus_edge_delay();
@@ -177,14 +211,18 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
             cpu_last = control;
 
          if ((control & Cart::COMMIT_SEL) != Cart::COMMIT_SEL) {
-            sel_control = control;
-            sel_pending = true;
+            if (++sel_samples >= C64_BUS_COMMIT_MIN_SAMPLES) {
+               sel_control = control;
+               sel_pending = true;
+            }
 
             if constexpr (bus_has_early_commit<Cart>::value) {
                // write cycle: apply at every sample, the last one wins
                if (!(control & RW_MASK) && ++early_samples >= C64_BUS_EARLY_COMMIT_SAMPLES)
                   cart.early_commit(control);
             }
+         } else {
+            sel_samples = 0;     // the run of samples with a select line ended
          }
 
          uint8_t data;
@@ -201,8 +239,11 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
       //
       // commit (PHI2 falling edge)
       //
-      if (sel_pending)
-         cart.commit(sel_control);
+      if (sel_pending) {
+         // a read with BA low is repeated by the 6510: commit the last one
+         if (!C64_BUS_BA_READ_FILTER || !(sel_control & RW_MASK) || (sel_control & BA_MASK))
+            cart.commit(sel_control);
+      }
 
       if constexpr (bus_has_cpu_trace<Cart>::value)
          cart.cpu_trace(cpu_last);

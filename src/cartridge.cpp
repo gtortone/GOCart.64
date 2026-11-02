@@ -1868,6 +1868,10 @@ bool run_prg(const uint8_t *prg, uint32_t size, const char *name) {
  *   CMD_EAPI_INIT                          -> reply 0
  *   CMD_WRITE_FLASH  addr_lo addr_hi value -> reply 0 / REPLY_WRITE_ERROR
  *   CMD_ERASE_SECTOR addr_lo addr_hi bank  -> reply 0 / REPLY_WRITE_ERROR
+ *   CMD_STREAM_TEST                        -> endless stream 0, 1, 2... 255, 0...
+ *                                             until the C64 stops reading (test
+ *                                             of the $DE0A reads, see
+ *                                             utils/mkcart_streamtest.py)
  * The bank is the one selected in $DE00 before the command.
  * Changes are kept in RAM only (lost on reset/power off).
  */
@@ -1876,6 +1880,7 @@ bool run_prg(const uint8_t *prg, uint32_t size, const char *name) {
 #define CMD_EAPI_INIT       0x01
 #define CMD_WRITE_FLASH     0x02
 #define CMD_ERASE_SECTOR    0x03
+#define CMD_STREAM_TEST     0x10
 #define REPLY_EAPI_OK       0x00
 #define REPLY_WRITE_ERROR   0x02
 
@@ -1899,6 +1904,10 @@ static uint8_t *eapi_get_chunk(uint8_t bank, bool romh) {
    return chunk;
 }
 
+#ifdef DEBUG
+static uint8_t eapi_dbg_old;      // flash value before the last write
+#endif
+
 static uint8_t eapi_write_flash(uint16_t addr, uint8_t value) {
 
    // $8000-$9FFF ROML, $A000-$BFFF / $E000-$FFFF ROMH
@@ -1907,6 +1916,9 @@ static uint8_t eapi_write_flash(uint16_t addr, uint8_t value) {
       return REPLY_WRITE_ERROR;
 
    uint8_t *dest = chunk + (addr & 0x1FFF);
+#ifdef DEBUG
+   eapi_dbg_old = *dest;
+#endif
    *dest &= value;      // flash can only clear bits
    save_mark(ef_cur_bank, addr & 0x2000);
 
@@ -1966,11 +1978,18 @@ static void ef_trace_print(void) {
 #ifdef DEBUG
 // number of EAPI flash writes not printed yet
 static uint32_t eapi_dbg_writes;
+static uint32_t eapi_dbg_failed;
+// first and last write of the sequence (bank << 16 | address)
+static uint32_t eapi_dbg_first, eapi_dbg_last;
 
 static void eapi_dbg_report(void) {
    if (eapi_dbg_writes)
-      printf("EAPI: %lu bytes written\n", (unsigned long)eapi_dbg_writes);
+      printf("EAPI: %lu bytes written (%lu failed), bank %lu $%04lX .. bank %lu $%04lX\n",
+             (unsigned long)eapi_dbg_writes, (unsigned long)eapi_dbg_failed,
+             (unsigned long)(eapi_dbg_first >> 16), (unsigned long)(eapi_dbg_first & 0xFFFF),
+             (unsigned long)(eapi_dbg_last >> 16), (unsigned long)(eapi_dbg_last & 0xFFFF));
    eapi_dbg_writes = 0;
+   eapi_dbg_failed = 0;
 }
 #endif
 
@@ -2005,16 +2024,36 @@ void cart_poll(void) {
    uint8_t cmd = eapi_window[4];
    memset(eapi_window, 0, sizeof(eapi_window));
 
+   if (cmd == CMD_STREAM_TEST) {
+      // ends when the C64 stops reading (ef3_putc timeout)
+      uint8_t value = 0;
+      uint32_t count = 0;
+#ifdef DEBUG
+      printf("EF3 stream test: started\n");
+#endif
+      while (ef3_putc(value)) {
+         value++;
+         count++;
+      }
+#ifdef DEBUG
+      printf("EF3 stream test: %lu bytes sent\n", (unsigned long)count);
+#endif
+      return;
+   }
+
    uint8_t reply = REPLY_EAPI_OK;
+   uint16_t addr = 0;
+   uint8_t wr_value = 0;     // value (write) or bank (erase)
 
    if (cmd == CMD_WRITE_FLASH || cmd == CMD_ERASE_SECTOR) {
       uint8_t args[3];    // addr_lo, addr_hi, value/bank
       if (!ef3_receive_data(args, sizeof(args)))
          return;
 
-      uint16_t addr = args[0] | (args[1] << 8);
-      reply = (cmd == CMD_WRITE_FLASH) ? eapi_write_flash(addr, args[2])
-                                       : eapi_erase_sector(addr, args[2]);
+      addr = args[0] | (args[1] << 8);
+      wr_value = args[2];
+      reply = (cmd == CMD_WRITE_FLASH) ? eapi_write_flash(addr, wr_value)
+                                       : eapi_erase_sector(addr, wr_value);
    }
 
    // reply first: the EAPI init waits for it only a few ms
@@ -2023,13 +2062,18 @@ void cart_poll(void) {
 #ifdef DEBUG
    // writes are only counted: printing every byte would slow down the EAPI
    if (cmd == CMD_WRITE_FLASH) {
+      uint32_t pos = ((uint32_t)ef_cur_bank << 16) | addr;
+      if (!eapi_dbg_writes)
+         eapi_dbg_first = pos;
+      eapi_dbg_last = pos;
       eapi_dbg_writes++;
-      if (reply != REPLY_EAPI_OK)
-         printf("EAPI: write in bank %u failed\n", ef_cur_bank);
+      if (reply != REPLY_EAPI_OK && ++eapi_dbg_failed <= 8)
+         printf("EAPI: write bank %u $%04X: $%02X -> $%02X failed\n",
+                ef_cur_bank, addr, eapi_dbg_old, wr_value);
    } else {
       eapi_dbg_report();
       if (cmd == CMD_ERASE_SECTOR)
-         printf("EAPI: erase -> %u\n", reply);
+         printf("EAPI: erase bank %u $%04X -> %u\n", wr_value, addr, reply);
       else
          printf("EAPI: command %u\n", cmd);
    }
