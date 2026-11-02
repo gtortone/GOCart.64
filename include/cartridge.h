@@ -97,6 +97,10 @@ void kff_send_byte(uint8_t data);
 void kff_init(void);
 void kff_dump(void);
 
+// EasyFlash chunk of a bank half (ROML/ROMH). alloc: the shared erased chunk
+// is replaced by a new one (copy on write), NULL if no memory is left
+uint8_t *ef_chunk(uint8_t bank, bool romh, bool alloc);
+
 // shell "cputrace" command (EF_DEBUG_CPU_TRACE in cartridge.cpp, DEBUG build)
 void cpu_trace_shell(char *args);
 

@@ -12,6 +12,7 @@
 #include "board.h"
 #include "commands.h"
 #include "filesystem.h"
+#include "ef_save.h"
 #include <string.h>
 #include <stdlib.h>     // strtoul
 
@@ -25,6 +26,9 @@ static uint8_t *ef_romh[EF_BANKS];
 // EasyFlash: first free 8K chunk and erased chunk (used by EAPI writes)
 static uint8_t *ef_blank;
 static uint32_t ef_next_chunk;
+
+// identity of the EasyFlash cartridge data, checked by the save file
+static uint32_t ef_crt_hash;
 
 // EasyFlash bank register, published by core1 for EAPI commands on core0
 static volatile uint8_t ef_cur_bank;
@@ -182,8 +186,6 @@ static void c64_clean_before_start(void) {
       run_c64_clean();
 }
 
-static void save_stop(void);
-
 // ROM select lines of a cartridge mode (same arguments as c64_set_exrom_game)
 static uint32_t cart_rom_mask(bool exrom, bool game) {
    if (!exrom)
@@ -194,7 +196,7 @@ static uint32_t cart_rom_mask(bool exrom, bool game) {
 static void cart_stop(void) {
 
    // write a pending EasyFlash save before crt_buf is reused
-   save_stop();
+   ef_save_stop();
 
    multicore_reset_core1();
 
@@ -367,217 +369,6 @@ static uint32_t cart_bank_mask(uint32_t size) {
    return mask - 1;
 }
 
-/*
- * EasyFlash save file
- *
- * Changes made by the cartridge through the EAPI (flash writes/erases) are
- * kept in a file next to the CRT: "<name>.crt" -> "<name>.sav". It holds the
- * 8K chunks (bank, ROML/ROMH) that differ from the CRT, so the CRT itself is
- * never modified and deleting the .sav restores the original cartridge.
- *
- *   SAVE_HEADER, then for every chunk: SAVE_RECORD + 8K of data
- *
- * The save file is applied when the CRT is started, if its header matches the
- * CRT (data size and hash). It is written SAVE_DELAY_US after the last EAPI
- * write (the cartridge keeps running), or before another cartridge is started.
- * It is written to a temporary file first and then renamed.
- */
-#define SAVE_MAGIC        "GC64SAV"
-#define SAVE_VERSION      1
-#define SAVE_DELAY_US     (1000 * 1000)
-#define SAVE_EXT          ".sav"
-#define SAVE_TMP_EXT      ".tmp"
-
-#pragma pack(push)
-#pragma pack(1)
-typedef struct {
-   char magic[8];          // SAVE_MAGIC
-   uint16_t version;       // SAVE_VERSION
-   uint16_t chunks;        // number of records
-   uint32_t crt_size;      // CRT data size (chips)
-   uint32_t crt_hash;      // FNV-1a of the CRT data (packed 8K chunks)
-} SAVE_HEADER;
-
-typedef struct {
-   uint8_t bank;           // EasyFlash bank (0-63)
-   uint8_t romh;           // 0: ROML, 1: ROMH
-   uint16_t reserved;
-} SAVE_RECORD;
-#pragma pack(pop)
-
-static char save_path[256 + 64];                  // "" = no save file
-static uint32_t save_crt_size;
-static uint32_t save_crt_hash;
-static uint8_t save_modified[EF_BANKS * 2 / 8];   // chunks different from the CRT
-static bool save_pending;                         // changes not written yet
-static uint64_t save_last_change;
-
-static inline bool save_is_modified(uint8_t bank, bool romh) {
-   uint8_t n = bank * 2 + romh;
-   return save_modified[n >> 3] & (1 << (n & 7));
-}
-
-// FNV-1a 32 bit
-static uint32_t save_hash(const uint8_t *data, uint32_t len) {
-   uint32_t h = 2166136261u;
-   while (len--) {
-      h ^= *data++;
-      h *= 16777619u;
-   }
-   return h;
-}
-
-// "<dir>/<name>.crt" -> "<dir>/<name>.sav" (absolute: the directory may change)
-static bool save_set_path(const char *file_name) {
-
-   save_path[0] = 0;
-   size_t max = sizeof(save_path) - sizeof(SAVE_TMP_EXT) - sizeof(SAVE_EXT);
-
-   if (file_name[0] == '/' || strchr(file_name, ':')) {
-      if (strlen(file_name) >= max)
-         return false;
-      strcpy(save_path, file_name);
-   } else {
-      if (!dir_current(save_path, max))
-         return false;
-      size_t len = strlen(save_path);
-      if (len + 1 + strlen(file_name) >= max) {
-         save_path[0] = 0;
-         return false;
-      }
-      if (len && save_path[len - 1] != '/')
-         strcat(save_path, "/");
-      strcat(save_path, file_name);
-   }
-
-   // replace the extension
-   char *slash = strrchr(save_path, '/');
-   char *dot = strrchr(save_path, '.');
-   if (dot && (!slash || dot > slash))
-      *dot = 0;
-   strcat(save_path, SAVE_EXT);
-   return true;
-}
-
-static uint8_t *eapi_get_chunk(uint8_t bank, bool romh);
-
-// apply the save file to the cartridge data (before core1 starts)
-static void save_load(void) {
-
-   FIL file;
-   if (!file_open(&file, save_path, FA_READ))
-      return;     // no save file yet
-
-   SAVE_HEADER h;
-   bool ok = file_read(&file, &h, sizeof(h)) == sizeof(h) &&
-             memcmp(h.magic, SAVE_MAGIC, sizeof(h.magic)) == 0 &&
-             h.version == SAVE_VERSION;
-
-   if (ok && (h.crt_size != save_crt_size || h.crt_hash != save_crt_hash)) {
-      printf("W: %s is for another cartridge, ignored\n", save_path);
-      file_close(&file);
-      return;
-   }
-
-   uint16_t n = 0;
-   for (; ok && n < h.chunks; n++) {
-      SAVE_RECORD r;
-      uint8_t *chunk;
-      ok = file_read(&file, &r, sizeof(r)) == sizeof(r) && r.bank < EF_BANKS &&
-           (chunk = eapi_get_chunk(r.bank, r.romh)) != NULL &&
-           file_read(&file, chunk, EF_CHUNK_SIZE) == EF_CHUNK_SIZE;
-      if (ok) {
-         uint8_t i = r.bank * 2 + (r.romh ? 1 : 0);
-         save_modified[i >> 3] |= 1 << (i & 7);
-      }
-   }
-
-   file_close(&file);
-
-   if (ok)
-      printf("EasyFlash: %d chunks loaded from %s\n", n, save_path);
-   else
-      printf("E: %s not valid\n", save_path);
-}
-
-// a chunk was changed by the cartridge
-static void save_mark(uint8_t bank, bool romh) {
-   uint8_t i = bank * 2 + (romh ? 1 : 0);
-   save_modified[i >> 3] |= 1 << (i & 7);
-   save_pending = true;
-   save_last_change = time_us_64();
-}
-
-static bool save_write_rec(FIL *file, uint8_t bank, bool romh) {
-   SAVE_RECORD r = { bank, (uint8_t)(romh ? 1 : 0), 0 };
-   uint8_t *chunk = romh ? ef_romh[bank] : ef_roml[bank];
-   return file_write(file, &r, sizeof(r)) == sizeof(r) &&
-          file_write(file, chunk, EF_CHUNK_SIZE) == EF_CHUNK_SIZE;
-}
-
-// write all the changed chunks (core1 keeps running: it only reads them)
-static void save_flush(void) {
-
-   save_pending = false;
-   if (!save_path[0])
-      return;
-
-   char tmp_path[sizeof(save_path)];
-   strcpy(tmp_path, save_path);
-   strcat(tmp_path, SAVE_TMP_EXT);
-
-   SAVE_HEADER h;
-   memcpy(h.magic, SAVE_MAGIC, sizeof(h.magic));
-   h.version = SAVE_VERSION;
-   h.chunks = 0;
-   h.crt_size = save_crt_size;
-   h.crt_hash = save_crt_hash;
-   for (uint8_t bank = 0; bank < EF_BANKS; bank++)
-      h.chunks += save_is_modified(bank, false) + save_is_modified(bank, true);
-
-   FIL file;
-   bool ok = file_open(&file, tmp_path, FA_WRITE | FA_CREATE_ALWAYS) &&
-             file_write(&file, &h, sizeof(h)) == sizeof(h);
-
-   for (uint8_t bank = 0; ok && bank < EF_BANKS; bank++) {
-      for (uint8_t romh = 0; ok && romh < 2; romh++) {
-         if (save_is_modified(bank, romh))
-            ok = save_write_rec(&file, bank, romh);
-      }
-   }
-
-   ok = file_close(&file) && ok;
-
-   // replace the old save file
-   if (ok) {
-      f_unlink(save_path);
-      ok = f_rename(tmp_path, save_path) == FR_OK;
-   }
-
-   if (ok)
-      printf("EasyFlash: %d chunks saved to %s\n", h.chunks, save_path);
-   else
-      printf("E: failed to write %s\n", save_path);
-}
-
-// write a pending save and forget the current save file
-static void save_stop(void) {
-   if (save_pending)
-      save_flush();
-   save_path[0] = 0;
-   save_pending = false;
-   memset(save_modified, 0, sizeof(save_modified));
-}
-
-// set up the save file of an EasyFlash cartridge just loaded
-static void save_start(const char *file_name, uint32_t crt_size) {
-   save_crt_size = crt_size;
-   if (file_name && save_set_path(file_name))
-      save_load();
-   else
-      printf("W: EasyFlash changes will not be saved\n");
-}
-
 // EAPI driver: $F800-$FAFF in bank 0 ROMH, $B800 in the 16K launcher image
 #define EAPI_OFFSET_ROMH       0x1800
 #define EAPI_OFFSET_LAUNCHER   0x3800
@@ -617,7 +408,7 @@ static void easyflash_build_tables(uint8_t chunks) {
    printf("EasyFlash: %d chunks (8K) used\n", chunks);
 
    // identity of the original cartridge data, checked by the save file
-   save_crt_hash = save_hash(crt_buf, (uint32_t)chunks * EF_CHUNK_SIZE);
+   ef_crt_hash = ef_save_hash(crt_buf, (uint32_t)chunks * EF_CHUNK_SIZE);
 
    // replace the EAPI flash driver in bank 0 ROMH ($F800) with the
    // Kung Fu Flash one from the launcher, that talks to cart_poll()
@@ -726,7 +517,7 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
       case 32:
          // EasyFlash (32)
          easyflash_build_tables(crt->getEasyFlashChunks());
-         save_start(file_name, crt->getSize());     // apply "<name>.sav", if any
+         ef_save_start(file_name, crt->getSize(), ef_crt_hash);   // apply "<name>.sav", if any
          eapi_active = true;
          args.crt_banks = crt_banks;
          args.crt_map = crt_map;
@@ -1904,6 +1695,12 @@ static uint8_t *eapi_get_chunk(uint8_t bank, bool romh) {
    return chunk;
 }
 
+uint8_t *ef_chunk(uint8_t bank, bool romh, bool alloc) {
+   if (alloc)
+      return eapi_get_chunk(bank, romh);
+   return romh ? ef_romh[bank] : ef_roml[bank];
+}
+
 #ifdef DEBUG
 static uint8_t eapi_dbg_old;      // flash value before the last write
 #endif
@@ -1920,7 +1717,7 @@ static uint8_t eapi_write_flash(uint16_t addr, uint8_t value) {
    eapi_dbg_old = *dest;
 #endif
    *dest &= value;      // flash can only clear bits
-   save_mark(ef_cur_bank, addr & 0x2000);
+   ef_save_mark(ef_cur_bank, addr & 0x2000);
 
    return (*dest == value) ? REPLY_EAPI_OK : REPLY_WRITE_ERROR;
 }
@@ -1937,7 +1734,7 @@ static uint8_t eapi_erase_sector(uint16_t addr, uint8_t bank) {
    for (uint8_t b = bank; b < bank + 8; b++) {
       if (tab[b] != ef_blank) {
          memset(tab[b], 0xFF, EF_CHUNK_SIZE);
-         save_mark(b, romh);
+         ef_save_mark(b, romh);
       }
    }
 
@@ -1996,11 +1793,11 @@ static void eapi_dbg_report(void) {
 void cart_poll(void) {
 
    // write the EasyFlash save file when the cartridge stopped writing
-   if (save_pending && time_us_64() - save_last_change > SAVE_DELAY_US) {
+   if (ef_save_due()) {
 #ifdef DEBUG
       eapi_dbg_report();
 #endif
-      save_flush();
+      ef_save_flush();
    }
 
 #if defined(DEBUG) && EF_DEBUG_TRACE
