@@ -54,8 +54,6 @@ int main(void) {
       cart_poll();      // serve the running cartridge (EAPI)
 #endif
 
-   //run_shell();
-
    return 0;
 }
 

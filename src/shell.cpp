@@ -244,11 +244,3 @@ void poll_shell(void) {
 }
 
 
-void run_shell(void) {
-
-   print_prompt(true);
-
-   while(1) {
-      poll_shell();      
-   }
-}
