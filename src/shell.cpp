@@ -13,6 +13,7 @@
 #include "filesystem.h"
 #include "menu.h"
 #include "shell_test.h"
+#include "psram.h"
 
 #define CMD_BUFFER_SIZE    128
 #define PATH_BUFFER_SIZE   128
@@ -132,6 +133,9 @@ void poll_shell(void) {
                   pattern = token;
             }
             shell_test(pattern, start, clean);
+         } else if (strcmp(token, "psram") == 0) {
+            // PSRAM info, memory test: psram [test [kb]]
+            psram_shell(strtok(NULL, ""));
          } else if (strcmp(token, "cputrace") == 0) {
             // EasyFlash CPU trace (EF_DEBUG_CPU_TRACE in cartridge.cpp)
             cpu_trace_shell(strtok(NULL, ""));

@@ -63,14 +63,22 @@ pico_board_cmake_set_default(PICO_RP2350_A2_SUPPORTED, 1)
 #define GC_GAME_PIN           44
 #define GC_EXROM_PIN          45
 
+//------------- PSRAM ------------//
+// QMI CS1 (XIP_CS1 is only on GPIO 0, 8, 19, 47). The PSRAM footprint on the
+// bottom side has CS on GPIO 0 (C64 A0): it is rewired to GPIO 47, which is
+// no longer used by BUTTON2
+#define GC_PSRAM_CS_PIN       47
+
 //------------ buttons ----------//
 #define GC_BUTTON1_PIN        46
-#define GC_BUTTON2_PIN        47
- 
+// GC_BUTTON2_PIN: GPIO 47 is the PSRAM chip select
+
 //------------ debug ------------//
-#define GC_DBG_UART_ID        0
-#define GC_DBG_UART_TX_PIN    46
-#define GC_DBG_UART_RX_PIN    47
+// UART1 on the free pins of the EXT SPI header (GPIO 40/41 are used by the
+// I2C slave): GPIO 42/43 have UART1 TX/RX as auxiliary function (RP2350)
+#define GC_DBG_UART_ID        1
+#define GC_DBG_UART_TX_PIN    42
+#define GC_DBG_UART_RX_PIN    43
 
 #endif
 

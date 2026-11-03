@@ -51,6 +51,10 @@ static uint8_t save_modified[EF_BANKS * 2 / 8];   // chunks different from the C
 static bool save_pending;                         // changes not written yet
 static uint64_t save_last_change;
 
+// file I/O of the chunks in pieces (the chunks may be in the PSRAM)
+#define SAVE_PIECE        256
+static uint8_t save_piece[SAVE_PIECE];
+
 static inline bool save_is_modified(uint8_t bank, bool romh) {
    uint8_t n = bank * 2 + romh;
    return save_modified[n >> 3] & (1 << (n & 7));
@@ -119,10 +123,10 @@ static void save_load(void) {
    uint16_t n = 0;
    for (; ok && n < h.chunks; n++) {
       SAVE_RECORD r;
-      uint8_t *chunk;
-      ok = file_read(&file, &r, sizeof(r)) == sizeof(r) && r.bank < EF_BANKS &&
-           (chunk = ef_chunk(r.bank, r.romh, true)) != NULL &&
-           file_read(&file, chunk, EF_CHUNK_SIZE) == EF_CHUNK_SIZE;
+      ok = file_read(&file, &r, sizeof(r)) == sizeof(r) && r.bank < EF_BANKS;
+      for (uint32_t ofs = 0; ok && ofs < EF_CHUNK_SIZE; ofs += SAVE_PIECE)
+         ok = file_read(&file, save_piece, SAVE_PIECE) == SAVE_PIECE &&
+              ef_chunk_write(r.bank, r.romh, ofs, save_piece, SAVE_PIECE);
       if (ok) {
          uint8_t i = r.bank * 2 + (r.romh ? 1 : 0);
          save_modified[i >> 3] |= 1 << (i & 7);
@@ -147,9 +151,11 @@ void ef_save_mark(uint8_t bank, bool romh) {
 
 static bool save_write_rec(FIL *file, uint8_t bank, bool romh) {
    SAVE_RECORD r = { bank, (uint8_t)(romh ? 1 : 0), 0 };
-   uint8_t *chunk = ef_chunk(bank, romh, false);
-   return file_write(file, &r, sizeof(r)) == sizeof(r) &&
-          file_write(file, chunk, EF_CHUNK_SIZE) == EF_CHUNK_SIZE;
+   bool ok = file_write(file, &r, sizeof(r)) == sizeof(r);
+   for (uint32_t ofs = 0; ok && ofs < EF_CHUNK_SIZE; ofs += SAVE_PIECE)
+      ok = ef_chunk_read(bank, romh, ofs, save_piece, SAVE_PIECE) &&
+           file_write(file, save_piece, SAVE_PIECE) == SAVE_PIECE;
+   return ok;
 }
 
 // write all the changed chunks (core1 keeps running: it only reads them)

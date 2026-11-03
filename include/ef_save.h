@@ -7,7 +7,8 @@
  * EasyFlash save file "<name>.sav" next to the CRT: the 8K chunks changed by
  * the cartridge through the EAPI (flash writes/erases). See ef_save.cpp.
  *
- * Chunk access (bank, ROML/ROMH) is provided by cartridge.cpp: ef_chunk().
+ * Chunk access (bank, ROML/ROMH) is provided by cartridge.cpp:
+ * ef_chunk_read(), ef_chunk_write().
  */
 
 // FNV-1a 32 bit hash of the CRT data, identity of the cartridge for the save file

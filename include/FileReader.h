@@ -37,6 +37,10 @@ public:
       return !fileOpened || f_eof(&file);
    }
 
+   size_t size() const override {
+      return fileOpened ? f_size(const_cast<FIL*>(&file)) : 0;
+   }
+
 private:
    FIL file;
    bool fileOpened;

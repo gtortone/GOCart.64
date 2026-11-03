@@ -1,0 +1,30 @@
+;
+; C64 bus driver during DMA (see c64_dma_bus_start in c64_interface.h)
+;
+; While the cartridge stops the 6510 with the DMA line, nobody drives the
+; address bus and R/W in the PHI2 high phases: the C64 still decodes them as
+; CPU cycles, and a floating address can corrupt the DRAM. A DMA master (e.g.
+; a REU) drives the bus: this program drives A0-A15 = $FFFF and R/W = read
+; (pin values preset to 1) in every PHI2 high phase, for ~340 ns, unless the
+; VIC-II takes the bus: with BA low the first cycles are still CPU cycles
+; (the VIC-II takes the bus 3 cycles later), only 2 of them are driven.
+;
+; in pin 0  = PHI2, jmp pin = BA, out pins = A0-A15, R/W (17 pins)
+; clock: sys clock (250 MHz, 4 ns per cycle)
+;
+.program dma_bus
+.wrap_target
+top:
+    wait 0 pin 0            ; PHI2 low (VIC-II phase)
+    wait 1 pin 0            ; PHI2 high
+    jmp pin bahigh          ; BA high: free CPU cycle
+    jmp x-- drive           ; BA low: drive the first cycles only
+    jmp top
+bahigh:
+    set x, 2
+drive:
+    mov pindirs, ~null [31] ; drive A0-A15, R/W
+    nop [31]
+    nop [20]
+    mov pindirs, null       ; release ~340 ns after PHI2 rises
+.wrap

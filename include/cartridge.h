@@ -107,9 +107,13 @@ void kff_send_byte(uint8_t data);
 void kff_init(void);
 void kff_dump(void);
 
-// EasyFlash chunk of a bank half (ROML/ROMH). alloc: the shared erased chunk
-// is replaced by a new one (copy on write), NULL if no memory is left
-uint8_t *ef_chunk(uint8_t bank, bool romh, bool alloc);
+// EasyFlash chunk of a bank half (ROML/ROMH), 8K, in SRAM or in the PSRAM
+// (see the EasyFlash PSRAM cache in cartridge.cpp), core0 only.
+// read: a missing chunk reads as erased ($FF)
+// write: replaces the bytes (not a flash write), a missing chunk is
+// allocated first (erased); false if no memory is left
+bool ef_chunk_read(uint8_t bank, bool romh, uint32_t ofs, uint8_t *dst, uint32_t len);
+bool ef_chunk_write(uint8_t bank, bool romh, uint32_t ofs, const uint8_t *src, uint32_t len);
 
 // shell "cputrace" command (EF_DEBUG_CPU_TRACE in cartridge.cpp, DEBUG build)
 void cpu_trace_shell(char *args);

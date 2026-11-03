@@ -31,6 +31,10 @@ public:
       return pos >= length; 
    }
 
+   size_t size() const override {
+      return length;
+   }
+
 private:
    const uint8_t* buffer;
    size_t length;

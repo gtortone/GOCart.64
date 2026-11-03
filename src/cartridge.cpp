@@ -13,13 +13,16 @@
 #include "commands.h"
 #include "filesystem.h"
 #include "ef_save.h"
+#include "psram.h"
 #include <string.h>
 #include <stdlib.h>     // strtoul
 
-uint8_t crt_buf[CRT_BUFFER_SIZE] = {};
+// aligned: 8K chunks are copied with 32-bit accesses (EasyFlash PSRAM cache)
+uint8_t crt_buf[CRT_BUFFER_SIZE] __attribute__((aligned(8))) = {};
 uint8_t crt_map[EF_MAP_SIZE] = {};
 
 // EasyFlash bank -> 8K chunk pointers (built by run_cart, read by core1)
+// NULL: chunk in the PSRAM, not in the cache (see below)
 static uint8_t *ef_roml[EF_BANKS];
 static uint8_t *ef_romh[EF_BANKS];
 
@@ -35,6 +38,271 @@ static volatile uint8_t ef_cur_bank;
 
 // EAPI commands are served by cart_poll() on core0
 static bool eapi_active = false;
+
+/*
+ * EasyFlash PSRAM cache
+ *
+ * An EasyFlash CRT larger than crt_buf (up to 1 MB) is loaded into the PSRAM:
+ * chunk n (8K, same packing as in crt_buf, see CRTParser) at PSRAM offset
+ * n * 8K. The PSRAM is too slow to be read in a bus cycle (the data must be
+ * on the bus ~100 ns after ROML/ROMH), so crt_buf becomes a cache of
+ * EF_SLOTS chunks, the slot after the last one holds the erased chunk.
+ *
+ * ef_roml/ef_romh point to the cached chunk or are NULL. A $DE00 write that
+ * selects a bank with a chunk not in the cache (core1, commit at the end of
+ * the write cycle) asserts the DMA line: the 6510 stops at the next cycle,
+ * that is a read. While it is stopped the PIO drives the address bus and R/W
+ * (see dma_bus.pio). The chunk is copied from the PSRAM to a slot (free, else
+ * round robin, never the bank 0 chunks: the EasyFlash menus and loaders run
+ * from bank 0 and come back to it after every access to another bank), then
+ * DMA is released at a PHI2 falling edge and the 6510 repeats its read. The
+ * VIC-II keeps running (an Ultimax ROMH fetch during the copy reads garbage).
+ * A copy takes ~0.35 ms per 8K (~0.7 ms with the check). Nothing is done on
+ * a cache hit: the $DE00 write is handled as with the cartridge in SRAM.
+ *
+ * The cache functions used by core1 are in SCRATCH_Y (main RAM is full).
+ *
+ * The PSRAM holds the cartridge data: EAPI writes (core0) go to the PSRAM and
+ * to the cached copy, if any. Core0 and core1 do not change the cache at the
+ * same time: EAPI commands are sent with the bank already selected (no $DE00
+ * write while core0 serves them), the save file is read from the PSRAM.
+ */
+// EasyFlash CPU trace (DEBUG build), see EF_DEBUG_CPU_TRACE below
+#ifndef EF_DEBUG_CPU_TRACE
+#define EF_DEBUG_CPU_TRACE   0
+#endif
+
+#if defined(DEBUG) && EF_DEBUG_CPU_TRACE
+// the CPU trace uses the end of crt_buf
+#define EF_SLOTS              ((CRT_BUFFER_SIZE - 128 * 1024) / EF_CHUNK_SIZE - 1)   // CPU_TRACE_BYTES
+#else
+#define EF_SLOTS              (CRT_BUFFER_SIZE / EF_CHUNK_SIZE - 1)
+#endif
+#define EF_SLOT(n)            (crt_buf + (uint32_t)(n) * EF_CHUNK_SIZE)
+#define EF_PSRAM_CHUNK(c)     PSRAM_UNCACHED((uint32_t)(c) * EF_CHUNK_SIZE)
+#define EF_PSRAM_MAX          ((uint32_t)EF_MAP_SIZE * EF_CHUNK_SIZE)
+#define EF_NO_SLOT            0xFF
+
+static bool ef_psram;                            // cartridge data in the PSRAM
+static uint8_t ef_slot_chunk[EF_SLOTS];          // slot -> chunk, EF_CHUNK_NONE: free
+static uint8_t ef_chunk_slot[EF_MAP_SIZE];       // chunk -> slot, EF_NO_SLOT
+static uint32_t ef_victim;                       // next slot to replace (round robin)
+static volatile uint32_t ef_misses;              // cache misses served by core1
+
+// point every bank half that uses the chunk to ptr
+static void __attribute__((noinline)) __scratch_y("ef_cache_map") ef_cache_map(uint8_t chunk, uint8_t *ptr) {
+   for (uint32_t i = 0; i < EF_BANKS; i++) {
+      if (crt_map[i] == chunk)
+         ef_roml[i] = ptr;
+      if (crt_map[EF_BANKS + i] == chunk)
+         ef_romh[i] = ptr;
+   }
+}
+
+// copy a chunk from the PSRAM to a slot (free, else round robin: no work
+// is done on cache hits), never the slot keep nor a bank 0 chunk; returns
+// the slot
+static uint32_t __attribute__((noinline)) __scratch_y("ef_cache_load") ef_cache_load(uint8_t chunk, uint32_t keep) {
+
+   uint32_t slot = EF_SLOTS;
+   for (uint32_t n = 0; n < EF_SLOTS; n++) {
+      if (ef_slot_chunk[n] == EF_CHUNK_NONE && n != keep) {
+         slot = n;
+         break;
+      }
+   }
+   if (slot == EF_SLOTS) {
+      slot = ef_victim;
+      for (uint32_t n = 0; n < EF_SLOTS; n++) {
+         uint8_t c = ef_slot_chunk[slot];
+         if (slot != keep && c != crt_map[0] && c != crt_map[EF_BANKS])
+            break;
+         slot = (slot + 1) % EF_SLOTS;
+      }
+      ef_victim = (slot + 1) % EF_SLOTS;
+   }
+
+   uint8_t old = ef_slot_chunk[slot];
+   if (old != EF_CHUNK_NONE) {
+      ef_chunk_slot[old] = EF_NO_SLOT;
+      ef_cache_map(old, NULL);
+   }
+
+   const volatile uint32_t *src = (const volatile uint32_t *)EF_PSRAM_CHUNK(chunk);
+   uint32_t *dst = (uint32_t *)EF_SLOT(slot);
+   for (uint32_t i = 0; i < EF_CHUNK_SIZE / 4; i++)
+      dst[i] = src[i];
+   // check: read again, a word that differs is read until two reads agree
+   for (uint32_t i = 0; i < EF_CHUNK_SIZE / 4; i++) {
+      uint32_t v = src[i];
+      if (v != dst[i]) {
+         uint32_t w;
+         for (int n = 0; n < 8 && (w = src[i]) != v; n++)
+            v = w;
+         dst[i] = v;
+      }
+   }
+
+   ef_slot_chunk[slot] = chunk;
+   ef_chunk_slot[chunk] = slot;
+   ef_cache_map(chunk, EF_SLOT(slot));
+   return slot;
+}
+
+// slot of a cached chunk pointer (EF_SLOTS: erased chunk)
+static inline __attribute__((always_inline)) uint32_t ef_slot_of(const uint8_t *ptr) {
+   return (uint32_t)(ptr - crt_buf) / EF_CHUNK_SIZE;
+}
+
+// core1: bank with a chunk not in the cache selected by a $DE00 write
+// (called at the end of the write cycle)
+static void __attribute__((noinline)) __scratch_y("ef_cache_miss") ef_cache_miss(uint8_t bank) {
+
+   c64_dma_assert();
+   c64_dma_bus_start();
+
+   uint32_t keep = EF_SLOTS;
+   if (!ef_roml[bank])
+      keep = ef_cache_load(crt_map[bank], EF_SLOTS);
+   else
+      keep = ef_slot_of(ef_roml[bank]);
+   if (!ef_romh[bank])
+      ef_cache_load(crt_map[EF_BANKS + bank], keep);
+
+   // release at a PHI2 falling edge: the bus loop continues with the VIC-II
+   // phase, the 6510 repeats its read in the next PHI2 phase.
+   // c64_dma_bus_stop() is quick (the pins keep the PIO function): the bus
+   // loop must be back before the next PHI2 rising edge
+   wait_high(PHI2);
+   wait_low(PHI2);
+   c64_dma_bus_stop();
+   c64_dma_release();
+   ef_misses = ef_misses + 1;
+}
+
+// core0: PSRAM chunk of a bank half, allocated (erased) if missing and alloc;
+// NULL if missing
+static uint8_t *ef_psram_chunk(uint8_t bank, bool romh, bool alloc) {
+   uint8_t *map = &crt_map[(romh ? EF_BANKS : 0) + bank];
+   if (*map == EF_CHUNK_NONE) {
+      if (!alloc || ef_next_chunk >= EF_MAP_SIZE)
+         return NULL;
+      uint8_t chunk = ef_next_chunk++;
+      memset(EF_PSRAM_CHUNK(chunk), 0xFF, EF_CHUNK_SIZE);
+      *map = chunk;
+      // it pointed to the erased chunk: core1 loads it at the next $DE00
+      // write (EAPI always sets the bank)
+      (romh ? ef_romh : ef_roml)[bank] = NULL;
+   }
+   return EF_PSRAM_CHUNK(*map);
+}
+
+// core0: cached copy of the PSRAM chunk of a bank half, NULL if not cached
+static uint8_t *ef_cached_chunk(uint8_t bank, bool romh) {
+   uint8_t chunk = crt_map[(romh ? EF_BANKS : 0) + bank];
+   if (chunk == EF_CHUNK_NONE || ef_chunk_slot[chunk] == EF_NO_SLOT)
+      return NULL;
+   return EF_SLOT(ef_chunk_slot[chunk]);
+}
+
+// core0, before core1 starts: empty cache, bank 0 first, then the chunks in
+// load order while slots are free
+static void ef_cache_fill(uint8_t chunks) {
+
+   memset(ef_slot_chunk, EF_CHUNK_NONE, sizeof(ef_slot_chunk));
+   memset(ef_chunk_slot, EF_NO_SLOT, sizeof(ef_chunk_slot));
+   ef_victim = 0;
+   ef_misses = 0;
+
+   uint32_t keep = EF_SLOTS;
+   if (crt_map[0] != EF_CHUNK_NONE)
+      keep = ef_cache_load(crt_map[0], EF_SLOTS);
+   if (crt_map[EF_BANKS] != EF_CHUNK_NONE)
+      ef_cache_load(crt_map[EF_BANKS], keep);
+
+   for (uint8_t c = 0; c < chunks; c++) {
+      if (ef_chunk_slot[c] != EF_NO_SLOT)
+         continue;
+      bool free_slot = false;
+      for (uint32_t n = 0; n < EF_SLOTS; n++)
+         free_slot |= ef_slot_chunk[n] == EF_CHUNK_NONE;
+      if (!free_slot)
+         break;
+      ef_cache_load(c, EF_SLOTS);
+   }
+
+   uint32_t cached = 0;
+   for (uint32_t n = 0; n < EF_SLOTS; n++)
+      cached += ef_slot_chunk[n] != EF_CHUNK_NONE;
+   printf("EasyFlash: PSRAM, %lu of %d chunks in the cache\n", (unsigned long)cached, chunks);
+}
+
+/*
+ * Reader for a CRT loaded into the PSRAM: the data goes through a buffer in
+ * SRAM (the SD card driver is not used with XIP addresses)
+ */
+class PsramBounceReader : public IDataReader {
+public:
+   PsramBounceReader(IDataReader &r, uint8_t *buf, uint32_t buf_size) :
+      r(r), buf(buf), buf_size(buf_size) {}
+
+   bool read(uint8_t *dst, size_t n) override {
+      if ((uint32_t)dst < 0x10000000u || (uint32_t)dst >= 0x20000000u)
+         return r.read(dst, n);
+      while (n) {
+         uint32_t k = n < buf_size ? n : buf_size;
+         if (!r.read(buf, k))
+            return false;
+         memcpy(dst, buf, k);
+         // read back, write again the bytes that differ
+         for (uint32_t i = 0; i < k; i++) {
+            const volatile uint8_t *p = dst + i;
+            if (*p != buf[i]) {
+               for (int t = 0; t < 8 && *p != buf[i]; t++)
+                  *(volatile uint8_t *)p = buf[i];
+            }
+         }
+         // data written to the PSRAM, in order (checked after the load)
+         if (dst != PSRAM_UNCACHED(written))
+            contiguous = false;
+         for (uint32_t i = 0; i < k; i++) {
+            hash ^= buf[i];
+            hash *= 16777619u;
+         }
+         written += k;
+         dst += k;
+         n -= k;
+      }
+      return true;
+   }
+
+   // after the load: the PSRAM holds the data written (when written in
+   // order from offset 0, as for EasyFlash); false if not or if it differs
+   bool check(void) const {
+      return contiguous && ef_save_hash(PSRAM_UNCACHED(0), written) == hash;
+   }
+
+   void restart(void) {
+      written = 0;
+      hash = 2166136261u;
+      contiguous = true;
+   }
+
+   uint32_t bytes(void) const { return written; }
+
+   bool seek(size_t pos) override { return r.seek(pos); }
+   size_t tell() const override { return r.tell(); }
+   bool eof() const override { return r.eof(); }
+   size_t size() const override { return r.size(); }
+
+private:
+   IDataReader &r;
+   uint8_t *buf;
+   uint32_t buf_size;
+   uint32_t written = 0;
+   uint32_t hash = 2166136261u;      // FNV-1a of the data written
+   bool contiguous = true;
+};
 
 /*
  * EF_DEBUG_TRACE (needs a DEBUG build)
@@ -64,14 +332,14 @@ static volatile uint32_t ef_trace_head;
  *      select lines, BA) is recorded by core1 in a ring buffer at the end of
  *      crt_buf, like a logic analyzer. Recording stops CPU_TRACE_POST cycles
  *      after the CPU reads a trigger address outside the cartridge ROM
- *      (defaults: see cpu_trace_trig_addr). Consecutive identical cycles
- *      are recorded once (a JAM does not overwrite the history).
+ *      (defaults: see cpu_trace_trig_addr), or after the same cycle is
+ *      repeated CPU_TRACE_JAM_CYCLES times (JAM, always enabled), or at a BRK
+ *      instruction (crash into zeroed memory; "cputrace brk on|off").
+ *      Consecutive identical cycles are recorded once (a JAM does not
+ *      overwrite the history).
  *      Shell command: cputrace [dump [n] | trig [w]<addr>[=<data>] ... | stop | run]
  *   0: disabled
  */
-#ifndef EF_DEBUG_CPU_TRACE
-#define EF_DEBUG_CPU_TRACE   0
-#endif
 
 #if defined(DEBUG) && EF_DEBUG_CPU_TRACE
 #define CPU_TRACE_ENTRIES   (32 * 1024)                 // 128K, power of 2
@@ -93,6 +361,9 @@ static volatile uint32_t cpu_trace_trig_addr[CPU_TRACE_TRIGGERS] = { 0xFE66, 0xE
 static volatile uint32_t cpu_trace_trig_data[CPU_TRACE_TRIGGERS] = { 0x100, 0x00 };
 static volatile bool cpu_trace_trig_write[CPU_TRACE_TRIGGERS] = { false, false };   // write instead of read
 static uint32_t cpu_trace_last;
+static uint32_t cpu_trace_repeat;            // repetitions of cpu_trace_last
+static volatile bool cpu_trace_brk = true;   // trigger: BRK instruction
+#define CPU_TRACE_JAM_CYCLES  1000           // trigger: the same cycle repeated
 
 static void cpu_trace_reset(bool available) {
    cpu_trace_on = false;
@@ -100,6 +371,7 @@ static void cpu_trace_reset(bool available) {
    cpu_trace_post = 0;
    cpu_trace_trig_at = 0xFFFFFFFF;
    cpu_trace_last = 0;
+   cpu_trace_repeat = 0;
    cpu_trace_frozen = false;
    cpu_trace_on = available;
 }
@@ -107,9 +379,26 @@ static void cpu_trace_reset(bool available) {
 // core1, once per cycle
 static inline __attribute__((always_inline)) void cpu_trace_record(uint32_t control) {
 
-   if (!cpu_trace_on || cpu_trace_frozen || control == cpu_trace_last)
+   if (!cpu_trace_on || cpu_trace_frozen)
       return;
 
+   if (control == cpu_trace_last) {
+      // the same cycle repeated many times: the 6510 is stuck (JAM: it reads
+      // $FFFF at every cycle), trigger at the first one
+      if (++cpu_trace_repeat == CPU_TRACE_JAM_CYCLES && !cpu_trace_post && (control & BA_MASK)) {
+         cpu_trace_trig_at = cpu_trace_head - 1;
+         cpu_trace_post = CPU_TRACE_POST;
+      }
+      return;
+   }
+
+   // BRK: the status register pushed with B set (bit 4), then the vector
+   // read at $FFFE (an IRQ pushes it with B clear)
+   bool brk = (control & BA_MASK) && (control & RW_MASK) && bus_addr(control) == 0xFFFE &&
+              !(cpu_trace_last & RW_MASK) && (bus_addr(cpu_trace_last) >> 8) == 0x01 &&
+              (bus_data(cpu_trace_last) & 0x10);
+
+   cpu_trace_repeat = 0;
    cpu_trace_last = control;
    uint32_t head = cpu_trace_head;
    cpu_trace_buf[head & (CPU_TRACE_ENTRIES - 1)] = control;
@@ -120,9 +409,13 @@ static inline __attribute__((always_inline)) void cpu_trace_record(uint32_t cont
       if (--post == 0)
          cpu_trace_frozen = true;
       cpu_trace_post = post;
-   } else if (!bus_rom_sel(control)) {
+   } else if (brk && cpu_trace_brk) {
+      cpu_trace_trig_at = head;
+      cpu_trace_post = CPU_TRACE_POST;
+   } else if (!bus_rom_sel(control) && (control & BA_MASK)) {
       // reads of the cartridge ROM do not trigger (e.g. the EasyFlash boot
-      // code copies $FE00-$FEFF from ROMH in Ultimax mode)
+      // code copies $FE00-$FEFF from ROMH in Ultimax mode), nor cycles with
+      // BA low (VIC-II accesses, e.g. a screen at $FC00)
       uint32_t addr = bus_addr(control);
       bool write = !(control & RW_MASK);
       for (int i = 0; i < CPU_TRACE_TRIGGERS; i++) {
@@ -136,6 +429,7 @@ static inline __attribute__((always_inline)) void cpu_trace_record(uint32_t cont
       }
    }
 }
+
 #define EF_BUF_LIMIT   (CRT_BUFFER_SIZE - (cpu_trace_on ? CPU_TRACE_BYTES : 0))
 #else
 #define EF_BUF_LIMIT   CRT_BUFFER_SIZE
@@ -199,9 +493,12 @@ static void cart_stop(void) {
    ef_save_stop();
 
    multicore_reset_core1();
+   c64_dma_bus_restore();  // core1 may have been stopped during a DMA pause
+   c64_dma_release();
 
    c64_hold_reset();
    c64_set_exrom_game(1, 1);
+   ef_psram = false;
 
    eapi_active = false;
 #if defined(DEBUG) && EF_DEBUG_CPU_TRACE
@@ -374,6 +671,39 @@ static uint32_t cart_bank_mask(uint32_t size) {
 #define EAPI_OFFSET_LAUNCHER   0x3800
 #define EAPI_SIZE              0x300
 
+// EasyFlash cartridge in the PSRAM (see the EasyFlash PSRAM cache): pointer
+// tables (missing chips: erased chunk, the others: not cached yet), hash and
+// EAPI replacement on the PSRAM data. The cache is filled by ef_cache_fill()
+// after the save file has been applied.
+static void easyflash_build_tables_psram(uint8_t chunks) {
+
+   uint8_t *blank = EF_SLOT(EF_SLOTS);
+   memset(blank, 0xFF, EF_CHUNK_SIZE);
+   ef_blank = blank;
+   ef_next_chunk = chunks;
+   ef_cur_bank = 0;
+
+   for (int bank = 0; bank < EF_BANKS; bank++) {
+      ef_roml[bank] = (crt_map[bank] == EF_CHUNK_NONE) ? blank : NULL;
+      ef_romh[bank] = (crt_map[EF_BANKS + bank] == EF_CHUNK_NONE) ? blank : NULL;
+   }
+
+   printf("EasyFlash: %d chunks (8K) in the PSRAM\n", chunks);
+
+   ef_crt_hash = ef_save_hash(EF_PSRAM_CHUNK(0), (uint32_t)chunks * EF_CHUNK_SIZE);
+
+   uint8_t c = crt_map[EF_BANKS];
+   uint8_t *eapi = (c == EF_CHUNK_NONE) ? NULL : EF_PSRAM_CHUNK(c) + EAPI_OFFSET_ROMH;
+   if (eapi && memcmp(eapi, "eapi", 4) == 0 &&
+       memcmp(CRT_LAUNCHER + EAPI_OFFSET_LAUNCHER, "eapi", 4) == 0) {
+      memcpy(eapi, CRT_LAUNCHER + EAPI_OFFSET_LAUNCHER, EAPI_SIZE);
+      bool ok = memcmp(eapi, CRT_LAUNCHER + EAPI_OFFSET_LAUNCHER, EAPI_SIZE) == 0;
+      printf("EasyFlash: EAPI replaced%s\n", ok ? "" : " (PSRAM check FAILED)");
+   } else {
+      printf("EasyFlash: no EAPI found, flash writes not supported\n");
+   }
+}
+
 // EasyFlash: resolve the chunk map built by CRTParser into pointer tables.
 // Missing chips point to an erased (0xFF) chunk, like an empty flash.
 static void easyflash_build_tables(uint8_t chunks) {
@@ -382,9 +712,15 @@ static void easyflash_build_tables(uint8_t chunks) {
 
 #if defined(DEBUG) && EF_DEBUG_CPU_TRACE
    // the CPU trace uses the end of crt_buf, if the cartridge leaves it free
-   cpu_trace_reset((uint32_t)(chunks + 1) * EF_CHUNK_SIZE <= CRT_BUFFER_SIZE - CPU_TRACE_BYTES);
+   cpu_trace_reset(ef_psram ||
+                   (uint32_t)(chunks + 1) * EF_CHUNK_SIZE <= CRT_BUFFER_SIZE - CPU_TRACE_BYTES);
    printf("EasyFlash: CPU trace %s\n", cpu_trace_on ? "on" : "off (cartridge too large)");
 #endif
+
+   if (ef_psram) {
+      easyflash_build_tables_psram(chunks);
+      return;
+   }
 
    if ((uint32_t)(chunks + 1) * EF_CHUNK_SIZE <= EF_BUF_LIMIT) {
       blank = crt_buf + (uint32_t)chunks * EF_CHUNK_SIZE;
@@ -461,13 +797,40 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
    // static: core1 reads it after this function has returned
    static core1_args_t args;
 
-   CRTParser *crt = new CRTParser(r, crt_buf, sizeof(crt_buf), crt_map, sizeof(crt_map));
-   if (crt->parse() != true) {
+   // a CRT larger than crt_buf is loaded into the PSRAM (EasyFlash only, see
+   // the EasyFlash PSRAM cache), crt_buf is the transfer buffer
+   bool to_psram = psram_size() >= EF_PSRAM_MAX && r.size() > sizeof(crt_buf);
+   PsramBounceReader pr(r, crt_buf, sizeof(crt_buf));
+   CRTParser *crt = to_psram ?
+      new CRTParser(pr, PSRAM_UNCACHED(0), EF_PSRAM_MAX, crt_map, sizeof(crt_map)) :
+      new CRTParser(r, crt_buf, sizeof(crt_buf), crt_map, sizeof(crt_map));
+   if (to_psram)
+      printf("cart: %lu bytes, loading into the PSRAM\n", (unsigned long)r.size());
+   bool parsed = crt->parse();
+   // PSRAM: data checked after the load, loaded again if it differs
+   for (int retry = 0; to_psram && parsed; retry++) {
+      bool ok = pr.check();
+      printf("PSRAM check: %lu bytes %s\n", (unsigned long)pr.bytes(), ok ? "OK" : "FAILED");
+      if (ok)
+         break;
+      if (retry == 2) {
+         parsed = false;
+         break;
+      }
+      delete crt;
+      pr.restart();
+      crt = new CRTParser(pr, PSRAM_UNCACHED(0), EF_PSRAM_MAX, crt_map, sizeof(crt_map));
+      parsed = pr.seek(0) && crt->parse();
+   }
+   if (parsed != true || (to_psram && crt->getType() != 32)) {
+      if (to_psram && crt->getType() != 32)
+         printf("E: cartridge too large (only EasyFlash can use the PSRAM)\n");
       printf("E: CRT parsing error\n");
       delete crt;
       c64_release_reset();      // no cartridge: the C64 starts BASIC
       return 1;
    }
+   ef_psram = to_psram;
 
    args = {};
    args.ultimax = crt->getExrom() && !crt->getGame();
@@ -617,6 +980,8 @@ uint8_t run_cart(IDataReader &r, const char *file_name) {
          // EasyFlash (32)
          easyflash_build_tables(crt->getEasyFlashChunks());
          ef_save_start(file_name, crt->getSize(), ef_crt_hash);   // apply "<name>.sav", if any
+         if (ef_psram)
+            ef_cache_fill(crt->getEasyFlashChunks());
          eapi_active = true;
          args.crt_banks = crt_banks;
          args.crt_map = crt_map;
@@ -1026,6 +1391,10 @@ static const uint32_t __not_in_flash("ef_mode") ef_rom_mask_table[4] = {
 struct EasyFlashCart {
 
    static constexpr uint32_t COMMIT_SEL = IO1_MASK | IO2_MASK;
+   // 15 cycles (60 ns at 250 MHz) after every PHI2 edge before the bus is
+   // sampled (see C64_BUS_EDGE_DELAY_CYCLES): without it some games
+   // (Neuromancer) crash at boot
+   static constexpr uint32_t EDGE_DELAY = 15;
 
    uint8_t * const *roml_tab;
    uint8_t * const *romh_tab;
@@ -1079,8 +1448,16 @@ struct EasyFlashCart {
 
             case 0x00: {   // $DE00 bank register
                uint8_t bank = data & (EF_BANKS - 1);
-               roml_ptr = roml_tab[bank];
-               romh_ptr = romh_tab[bank];
+               uint8_t *l = roml_tab[bank];
+               uint8_t *h = romh_tab[bank];
+               if (__builtin_expect(!l || !h, 0)) {
+                  // PSRAM cache miss: the 6510 waits (DMA)
+                  ef_cache_miss(bank);
+                  l = roml_tab[bank];
+                  h = romh_tab[bank];
+               }
+               roml_ptr = l;
+               romh_ptr = h;
                ef_cur_bank = bank;
                EF_TRACE(0x00, data);
                break;
@@ -2306,6 +2683,7 @@ bool run_prg(const uint8_t *prg, uint32_t size, const char *name) {
 
 // get the chunk of an EasyFlash bank half, allocating it if it is the
 // shared erased chunk (copy on write); returns NULL if no memory is left
+// (cartridge in SRAM)
 static uint8_t *eapi_get_chunk(uint8_t bank, bool romh) {
 
    uint8_t **tab = romh ? ef_romh : ef_roml;
@@ -2324,10 +2702,37 @@ static uint8_t *eapi_get_chunk(uint8_t bank, bool romh) {
    return chunk;
 }
 
-uint8_t *ef_chunk(uint8_t bank, bool romh, bool alloc) {
+// data of a bank half for core0 (cartridge data: SRAM chunk or PSRAM chunk),
+// NULL if missing and not alloc
+static uint8_t *ef_data(uint8_t bank, bool romh, bool alloc) {
+   if (ef_psram)
+      return ef_psram_chunk(bank, romh, alloc);
    if (alloc)
       return eapi_get_chunk(bank, romh);
-   return romh ? ef_romh[bank] : ef_roml[bank];
+   uint8_t *chunk = romh ? ef_romh[bank] : ef_roml[bank];
+   return (chunk == ef_blank) ? NULL : chunk;
+}
+
+bool ef_chunk_read(uint8_t bank, bool romh, uint32_t ofs, uint8_t *dst, uint32_t len) {
+   const uint8_t *data = ef_data(bank, romh, false);
+   if (data)
+      memcpy(dst, data + ofs, len);
+   else
+      memset(dst, 0xFF, len);
+   return true;
+}
+
+bool ef_chunk_write(uint8_t bank, bool romh, uint32_t ofs, const uint8_t *src, uint32_t len) {
+   uint8_t *data = ef_data(bank, romh, true);
+   if (!data)
+      return false;
+   memcpy(data + ofs, src, len);
+   if (ef_psram) {
+      uint8_t *cached = ef_cached_chunk(bank, romh);
+      if (cached)
+         memcpy(cached + ofs, src, len);
+   }
+   return true;
 }
 
 #ifdef DEBUG
@@ -2337,18 +2742,25 @@ static uint8_t eapi_dbg_old;      // flash value before the last write
 static uint8_t eapi_write_flash(uint16_t addr, uint8_t value) {
 
    // $8000-$9FFF ROML, $A000-$BFFF / $E000-$FFFF ROMH
-   uint8_t *chunk = eapi_get_chunk(ef_cur_bank, addr & 0x2000);
-   if (!chunk)
+   bool romh = addr & 0x2000;
+   uint8_t *data = ef_data(ef_cur_bank, romh, true);
+   if (!data)
       return REPLY_WRITE_ERROR;
 
-   uint8_t *dest = chunk + (addr & 0x1FFF);
+   uint32_t ofs = addr & 0x1FFF;
 #ifdef DEBUG
-   eapi_dbg_old = *dest;
+   eapi_dbg_old = data[ofs];
 #endif
-   *dest &= value;      // flash can only clear bits
-   ef_save_mark(ef_cur_bank, addr & 0x2000);
+   uint8_t v = data[ofs] & value;      // flash can only clear bits
+   data[ofs] = v;
+   if (ef_psram) {
+      uint8_t *cached = ef_cached_chunk(ef_cur_bank, romh);
+      if (cached)
+         cached[ofs] = v;
+   }
+   ef_save_mark(ef_cur_bank, romh);
 
-   return (*dest == value) ? REPLY_EAPI_OK : REPLY_WRITE_ERROR;
+   return (v == value) ? REPLY_EAPI_OK : REPLY_WRITE_ERROR;
 }
 
 static uint8_t eapi_erase_sector(uint16_t addr, uint8_t bank) {
@@ -2358,11 +2770,16 @@ static uint8_t eapi_erase_sector(uint16_t addr, uint8_t bank) {
       return REPLY_WRITE_ERROR;
 
    bool romh = (addr & 0xFF00) != 0x8000;
-   uint8_t **tab = romh ? ef_romh : ef_roml;
 
    for (uint8_t b = bank; b < bank + 8; b++) {
-      if (tab[b] != ef_blank) {
-         memset(tab[b], 0xFF, EF_CHUNK_SIZE);
+      uint8_t *data = ef_data(b, romh, false);
+      if (data) {
+         memset(data, 0xFF, EF_CHUNK_SIZE);
+         if (ef_psram) {
+            uint8_t *cached = ef_cached_chunk(b, romh);
+            if (cached)
+               memset(cached, 0xFF, EF_CHUNK_SIZE);
+         }
          ef_save_mark(b, romh);
       }
    }
@@ -2420,6 +2837,15 @@ static void eapi_dbg_report(void) {
 #endif
 
 void cart_poll(void) {
+
+#ifdef DEBUG
+   // EasyFlash PSRAM cache misses served by core1
+   static uint32_t dbg_misses;
+   if (ef_psram && ef_misses != dbg_misses) {
+      dbg_misses = ef_misses;
+      printf("EasyFlash: %lu cache misses\n", (unsigned long)dbg_misses);
+   }
+#endif
 
    // write the EasyFlash save file when the cartridge stopped writing
    if (ef_save_due()) {
@@ -2506,6 +2932,7 @@ void cart_poll(void) {
 #endif
 }
 
+
 #if defined(DEBUG) && EF_DEBUG_CPU_TRACE
 /*
  * Shell "cputrace" command (EasyFlash CPU trace, see EF_DEBUG_CPU_TRACE)
@@ -2516,11 +2943,13 @@ void cart_poll(void) {
  *                         "w" prefix), optionally only when the data is
  *                         <data>; "0" = none (stop manually).
  *                         Default: FE66 EA31=00
+ *   cputrace brk on|off   BRK trigger (default on)
  *   cputrace stop         stop recording now
  *   cputrace run          clear and record again
  * Line format: cycle (relative to the trigger or to the last one), address,
- * R/W, data, then the asserted lines (ROML ROMH IO1 IO2) and "ba" when the
- * VIC-II requests the bus (BA low).
+ * R/W, data, then the asserted lines (ROML ROMH IO1 IO2), "ba" when the
+ * VIC-II requests the bus (BA low) and "OUT" when the cartridge drove the
+ * data bus in that cycle.
  */
 static void cpu_trace_print_triggers(void) {
    printf("cputrace: triggers");
@@ -2569,6 +2998,14 @@ void cpu_trace_shell(char *args) {
       return;
    }
 
+   if (token && strcmp(token, "brk") == 0) {
+      token = strtok(NULL, " ");
+      if (token)
+         cpu_trace_brk = strcmp(token, "off") != 0;
+      printf("cputrace: BRK trigger %s\n", cpu_trace_brk ? "on" : "off");
+      return;
+   }
+
    if (token && strcmp(token, "stop") == 0) {
       cpu_trace_frozen = true;
       printf("cputrace: stopped\n");
@@ -2613,11 +3050,11 @@ void cpu_trace_shell(char *args) {
 
    for (uint32_t i = head - n; i != head; i++) {
       uint32_t c = cpu_trace_buf[i & (CPU_TRACE_ENTRIES - 1)];
-      printf("%+6ld %04lX %c %02X%s%s%s%s%s\n", (long)(i - ref),
+      printf("%+6ld %04lX %c %02X%s%s%s%s%s%s\n", (long)(i - ref),
              (unsigned long)bus_addr(c), (c & RW_MASK) ? 'r' : 'W', bus_data(c),
              (c & ROML_MASK) ? "" : " ROML", (c & ROMH_MASK) ? "" : " ROMH",
              (c & IO1_MASK) ? "" : " IO1", (c & IO2_MASK) ? "" : " IO2",
-             (c & BA_MASK) ? "" : " ba");
+             (c & BA_MASK) ? "" : " ba", (c & (1u << 31)) ? " OUT" : "");
    }
 }
 #else

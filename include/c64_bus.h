@@ -90,11 +90,11 @@
  *   mode, where every opcode is fetched from ROMH.
  */
 #ifndef C64_BUS_EDGE_DELAY_CYCLES
-#define C64_BUS_EDGE_DELAY_CYCLES   0
+#define C64_BUS_EDGE_DELAY_CYCLES   10       // works for C64C, C64 breadbin PLA GAL - EasyFlash with PSRAM
 #endif
 
 #ifndef C64_BUS_HOLD_CYCLES
-#define C64_BUS_HOLD_CYCLES         10
+#define C64_BUS_HOLD_CYCLES         5        // works for C64C, C64 breadbin PLA GAL - EasyFlash with PSRAM
 #endif
 
 /*
@@ -131,9 +131,12 @@
 #define C64_BUS_BA_READ_FILTER   1
 #endif
 
-BUS_INLINE void bus_edge_delay(void) {
+// extra: per-cart delay (EDGE_DELAY, compile time constant)
+BUS_INLINE void bus_edge_delay(uint32_t extra = 0) {
    if (C64_BUS_EDGE_DELAY_CYCLES > 0)
       busy_wait_at_least_cycles(C64_BUS_EDGE_DELAY_CYCLES);
+   if (extra > 0)
+      busy_wait_at_least_cycles(extra);
 }
 
 // release the data bus at the end of a phase, after the hold time
@@ -161,6 +164,13 @@ template <typename T, typename = void>
 struct bus_has_early_commit : std::false_type {};
 template <typename T>
 struct bus_has_early_commit<T, std::void_t<decltype(&T::early_commit)>> : std::true_type {};
+
+// optional per-cart extra delay after every PHI2 edge (cycles), added to
+// C64_BUS_EDGE_DELAY_CYCLES: "static constexpr uint32_t EDGE_DELAY = n;"
+template <typename T, typename = void>
+struct bus_cart_edge : std::integral_constant<uint32_t, 0> {};
+template <typename T>
+struct bus_cart_edge<T, std::void_t<decltype(T::EDGE_DELAY)>> : std::integral_constant<uint32_t, T::EDGE_DELAY> {};
 
 // detect the optional cpu_trace() method
 template <typename T, typename = void>
@@ -198,8 +208,10 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
       sel_pending = false;
       sel_samples = 0;
       early_samples = 0;
+      // cpu_trace: the data bus was driven in this phase (bit 31 of the record)
+      uint32_t drove = 0;
 
-      bus_edge_delay();
+      bus_edge_delay(bus_cart_edge<Cart>::value);
 
       while(1) {
 
@@ -208,7 +220,7 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
             break;
 
          if constexpr (bus_has_cpu_trace<Cart>::value)
-            cpu_last = control;
+            cpu_last = (control & ~(1u << 31)) | drove;
 
          if ((control & Cart::COMMIT_SEL) != Cart::COMMIT_SEL) {
             if (++sel_samples >= C64_BUS_COMMIT_MIN_SAMPLES) {
@@ -229,6 +241,8 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
          if ((control & RW_MASK) && cart.cpu_read(control, data)) {
             DATA_OUT(data);
             SET_DATA_MODE_OUT
+            if constexpr (bus_has_cpu_trace<Cart>::value)
+               drove = 1u << 31;
          } else {
             SET_DATA_MODE_IN
          }
@@ -253,7 +267,7 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
       //
       if (cart.vic_enabled()) {
 
-         bus_edge_delay();
+         bus_edge_delay(bus_cart_edge<Cart>::value);
 
          while(1) {
 

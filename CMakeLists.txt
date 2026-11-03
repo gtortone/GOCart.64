@@ -71,6 +71,7 @@ target_link_libraries(${PROJECT}
    pico_i2c_slave
    hardware_i2c
    hardware_flash
+   hardware_pio
    no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
 )
 
