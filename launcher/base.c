@@ -41,7 +41,7 @@
 #include "launcher_asm.h"
 
 #define LONG_PRESS  (180)
-#define KEY_PRESS   (80)
+#define KEY_PRESS   (30)
 #define KEY_REPEAT  (10)
 #define MIN_PRESS   (4)
 #define DEBOUNCE    (30)
