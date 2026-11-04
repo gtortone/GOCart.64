@@ -1,3 +1,8 @@
+/*
+ * WeAct Studio RP2350B Core, without PSRAM
+ * (with PSRAM: weact_rp2350b_core_psram.h, which includes this file)
+ */
+
 #ifndef WEACT_RP2350B_CORE_BOARD
 #define WEACT_RP2350B_CORE_BOARD
 
@@ -63,14 +68,21 @@ pico_board_cmake_set_default(PICO_RP2350_A2_SUPPORTED, 1)
 #define GC_GAME_PIN           44
 #define GC_EXROM_PIN          45
 
+//------------- PSRAM ------------//
+// GC_PSRAM_CS_PIN: set by weact_rp2350b_core_psram.h (board with the PSRAM)
+
 //------------ buttons ----------//
 #define GC_BUTTON1_PIN        46
-#define GC_BUTTON2_PIN        47
- 
+#ifndef GC_PSRAM_CS_PIN
+#define GC_BUTTON2_PIN        47    // with the PSRAM: its chip select
+#endif
+
 //------------ debug ------------//
-#define GC_DBG_UART_ID        0
-#define GC_DBG_UART_TX_PIN    46
-#define GC_DBG_UART_RX_PIN    47
+// UART1 on the free pins of the EXT SPI header (GPIO 40/41 are used by the
+// I2C slave): GPIO 42/43 have UART1 TX/RX as auxiliary function (RP2350)
+#define GC_DBG_UART_ID        1
+#define GC_DBG_UART_TX_PIN    42
+#define GC_DBG_UART_RX_PIN    43
 
 #endif
 
