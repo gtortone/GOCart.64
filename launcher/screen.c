@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <conio.h>
 #include <string.h>
+#include <c64.h>
 #include "screen.h"
 
 void clearArea(int xpos, int ypos, int xsize, int ysize)
@@ -58,9 +59,62 @@ void drawFrame(void)
   }
 }
 
+#if LAUNCHER_THIN_FONT
+/*
+ * Thin font: the upper/lower case character set of the C64 character ROM
+ * copied to FONT_RAM with the 2 pixel wide strokes made 1 pixel wide: the
+ * rightmost pixel of every horizontal run of 2 or more pixels is removed
+ * (also horizontal bars get 1 pixel shorter on the right, so they still end
+ * at the thinned vertical strokes); full rows are kept (block graphics).
+ * Characters 128-255 are the reverse of 0-127, as in the ROM. The VIC-II
+ * reads it from RAM at $2000 (bank 0).
+ * Starting a program or a cartridge resets the VIC-II (KERNAL CINT): the
+ * ROM font is back before the RAM at $2000 is overwritten.
+ */
+#define FONT_RAM   ((uint8_t *)0x2000)
+#define CHAR_ROM   ((const uint8_t *)0xd800)     // upper/lower case set
+
+static void initFont(void)
+{
+  uint16_t i;
+  uint8_t port, b, m;
+
+  // character ROM at $D000 (CHAREN low), interrupts off meanwhile
+  __asm__("sei");
+  port = *(uint8_t *)1;
+  *(uint8_t *)1 = port & ~0x04;
+  for (i=0; i<1024; i++)
+  {
+    FONT_RAM[i] = CHAR_ROM[i];
+  }
+  *(uint8_t *)1 = port;
+  __asm__("cli");
+
+  for (i=0; i<1024; i++)
+  {
+    b = FONT_RAM[i];
+    if (b != 0xff)
+    {
+      // pixel k (bit 7 = left) set, left neighbour set, right neighbour
+      // clear: rightmost pixel of a run
+      m = b & (b >> 1) & ~(b << 1);
+      b &= ~m;
+    }
+    FONT_RAM[i] = b;
+    FONT_RAM[1024 + i] = ~b;
+  }
+
+  // screen $0400, characters $2000
+  VIC.addr = (VIC.addr & 0xf0) | 0x08;
+}
+#endif
+
 /* initialize screen mode */
 void initScreen(unsigned char border, unsigned char bg, unsigned char text)
 {
+#if LAUNCHER_THIN_FONT
+  initFont();
+#endif
   bordercolor(border);
   bgcolor(bg);
   textcolor(text);

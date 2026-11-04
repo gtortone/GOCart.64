@@ -33,6 +33,9 @@
 #ifndef BASE_H
 #define BASE_H
 
+#include <stdint.h>
+#include <stdbool.h>
+
 #define JOY_MASK (JOY_UP_MASK|JOY_DOWN_MASK|JOY_LEFT_MASK|JOY_RIGHT_MASK|JOY_BTN_1_MASK)
 
 #define CH_NONE 0
@@ -45,6 +48,8 @@
 #define CH_FIRE_RIGHT   (0xdd)  // SHIFT and -
 
 uint8_t getJoy(void);
+// key in the KERNAL buffer, not made by a joystick in port 1
+bool keyHit(void);
 void waitKey(void);
 void waitRelease(void);
 

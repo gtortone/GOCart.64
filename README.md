@@ -176,16 +176,13 @@ Requirements:
   `CMakeLists.txt`: `/usr/share/pico-sdk`)
 - ARM GCC toolchain (`arm-none-eabi-gcc`), CMake
 - [cc65](https://cc65.github.io/) for the C64 launcher
-- `uf2conv` to build the UF2 image
+- `uf2conv` to build the UF2 image (optional)
 - Python 3 for the utilities
 
-Build the launcher first, then the firmware:
+CMake builds the C64 launcher (`launcher/CMakeLists.txt`) and the firmware,
+then appends the launcher to the firmware image:
 
 ```
-cd launcher
-make
-cd ..
-
 # board without PSRAM
 cmake -B build/release -DPICO_BOARD=weact_rp2350b_core
 cmake -B build/debug -DPICO_BOARD=weact_rp2350b_core -DDEBUG=ON
@@ -196,6 +193,17 @@ cmake -B build/debug -DPICO_BOARD=weact_rp2350b_core_psram -DDEBUG=ON
 
 make -C build/release
 ```
+
+cc65 is searched in the `PATH`; options:
+
+| Option | Meaning |
+|---|---|
+| `-DCC65_BIN_DIR=<dir>` | Directory of the cc65 binaries |
+| `-DCC65_HOME=<dir>` | cc65 directory with `include/`, `asminc/`, `lib/` (a cc65 built from source is found from its binaries) |
+| `-DGOCART_LAUNCHER_VERSION=<x.y>` | Version shown by the launcher (default 1.0) |
+| `-DGOCART_LAUNCHER_THEME=<n>` | Launcher color theme, see `launcher/screen.h` (default 1) |
+
+Without `uf2conv`, only the `.img.bin` image is built.
 
 The sources are collected with `file(GLOB)`: run `cmake` again after adding
 a source file.

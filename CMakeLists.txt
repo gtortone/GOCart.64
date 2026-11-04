@@ -83,21 +83,30 @@ target_link_options(${PROJECT_NAME} PRIVATE
 # create map/bin/hex file etc.
 pico_add_extra_outputs(${PROJECT})
 
-# create .bin file with launcher
+# C64 launcher (cc65, launcher/CMakeLists.txt): GOCART_LAUNCHER_BIN
+add_subdirectory(launcher)
+
+# firmware + launcher image: .bin (programmer) and .uf2 (BOOTSEL, needs
+# uf2conv), made again when the firmware or the launcher changes
+set(IMG_BIN ${CMAKE_BINARY_DIR}/${PROJECT}.img.bin)
+set(IMG_UF2 ${CMAKE_BINARY_DIR}/${PROJECT}.img.uf2)
+find_program(UF2CONV uf2conv)
+if(UF2CONV)
+   set(IMG_OUTPUTS ${IMG_BIN} ${IMG_UF2})
+   set(IMG_UF2_COMMAND COMMAND ${UF2CONV} ${IMG_BIN} -o ${IMG_UF2} -b 0x10000000)
+else()
+   message(WARNING "uf2conv not found: only ${PROJECT}.img.bin is built")
+   set(IMG_OUTPUTS ${IMG_BIN})
+   set(IMG_UF2_COMMAND "")
+endif()
 add_custom_command(
-   TARGET ${PROJECT} POST_BUILD
+   OUTPUT ${IMG_OUTPUTS}
    COMMAND ${CMAKE_COMMAND} -E cat
             ${CMAKE_BINARY_DIR}/${PROJECT}.bin
-            ${CMAKE_SOURCE_DIR}/launcher/build/KungFuLauncher_v2.XX.bin
-            > ${CMAKE_BINARY_DIR}/${PROJECT}.img.bin
+            ${GOCART_LAUNCHER_BIN}
+            > ${IMG_BIN}
+   ${IMG_UF2_COMMAND}
+   DEPENDS ${PROJECT} launcher ${GOCART_LAUNCHER_BIN}
+   COMMENT "Firmware image with launcher: ${PROJECT}.img.bin"
 )
-
-# create .uf2 file with launcher
-add_custom_command(
-   TARGET ${PROJECT} POST_BUILD
-   COMMAND uf2conv
-            ${CMAKE_BINARY_DIR}/${PROJECT}.img.bin
-            -o ${CMAKE_BINARY_DIR}/${PROJECT}.img.uf2
-            -b 0x10000000
-)
-
+add_custom_target(image ALL DEPENDS ${IMG_OUTPUTS})

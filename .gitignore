@@ -47,7 +47,4 @@ build-release/
 lib/*
 spikes/__pycache__
 spikes/*.crt
-launcher/build
-launcher/libef3usb/*.lib
-launcher/libef3usb/obj
 

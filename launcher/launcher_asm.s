@@ -174,3 +174,154 @@ _is_c128:
         inx
         txa
         rts
+
+; =============================================================================
+;
+; uint8_t read_joys(void);
+;
+; Joysticks in port 1 and port 2 (JOY_*_MASK bits, both ports ORed). Port 1
+; shares the keyboard lines: it is read with no keyboard column selected.
+; The port 1 bits are also ORed into joy1_bits (cleared by the caller).
+; Fast: called many times in a row by the joystick debounce (base.c).
+;
+; =============================================================================
+.bss
+.export _joy1_bits
+_joy1_bits:
+        .res 1
+joy_tmp:
+        .res 1
+
+.code
+.export _read_joys
+_read_joys:
+        sei
+        ldx $dc00                       ; keyboard column latch
+        lda #$ff
+        sta $dc00                       ; no keyboard column
+        lda $dc01                       ; port 1, active low
+        eor #$ff
+        and #$1f
+        sta joy_tmp
+        ora _joy1_bits
+        sta _joy1_bits
+        lda $dc00                       ; port 2, active low
+        eor #$ff
+        and #$1f
+        ora joy_tmp
+        stx $dc00
+        cli
+        ldx #0
+        rts
+
+; =============================================================================
+;
+; Selection bar: the background color ($D021) of one screen row is changed
+; by a raster interrupt, so the selected entry is shown with normal (not
+; reversed) characters in any color on a bar of any color.
+;
+; void selbar_init(void);
+;   selbar_color: bar color, selbar_bg: screen background color (set them
+;   first). The raster interrupt replaces the CIA1 timer interrupt: once per
+;   frame it draws the bar (busy waiting for the 8 raster lines of the row)
+;   and then runs the KERNAL interrupt code (jiffy clock, keyboard scan).
+;   Starting a program or a cartridge resets the CIAs and the VIC-II.
+;
+; selbar_row: screen row of the bar (1-24), SELBAR_OFF ($ff): no bar
+;
+; =============================================================================
+SELBAR_OFF      = $ff
+SELBAR_IDLE     = 250                   ; raster line of the IRQ without bar
+ROW0_LINE       = 51                    ; first raster line of screen row 0
+
+.data
+.export _selbar_row
+_selbar_row:
+        .byte SELBAR_OFF
+
+.bss
+.export _selbar_color
+_selbar_color:
+        .res 1
+.export _selbar_bg
+_selbar_bg:
+        .res 1
+selbar_line:
+        .res 1
+
+.code
+.export _selbar_init
+_selbar_init:
+        sei
+        lda #$7f
+        sta $dc0d                       ; no CIA1 interrupts
+        lda $dc0d                       ; acknowledge a pending one
+        lda #<selbar_irq
+        sta $0314
+        lda #>selbar_irq
+        sta $0315
+        jsr selbar_next
+        lda #$01
+        sta $d019                       ; acknowledge, enable raster IRQ
+        sta $d01a
+        cli
+        rts
+
+; raster compare: 3 lines before the bar (the bar starts after a busy wait,
+; also if the interrupt is a bit late), or SELBAR_IDLE
+selbar_next:
+        lda $d011
+        and #$7f                        ; raster line bit 8 = 0
+        sta $d011
+        lda _selbar_row
+        cmp #SELBAR_OFF
+        beq @idle
+        asl a
+        asl a
+        asl a
+        clc
+        adc #ROW0_LINE - 3
+        sta $d012
+        rts
+@idle:
+        lda #SELBAR_IDLE
+        sta $d012
+        rts
+
+; $D021 = X at the end of the raster line A (in the right border, after the
+; display window): the next line is a bad line (first line of a text row),
+; the 6510 is stopped from its cycle 12 on, so the color is changed before.
+; The line is detected with a jitter of up to ~11 cycles: the store lands in
+; cycles 56-66 of the line (display window: cycles 16-55)
+selbar_at_end:
+        sta selbar_line
+@wait:  lda $d012
+        cmp selbar_line
+        bcc @wait
+        ldy #9                          ; 46 cycles
+@delay: dey
+        bne @delay
+        stx $d021
+        rts
+
+selbar_irq:
+        lda $d019
+        sta $d019                       ; acknowledge
+        lda _selbar_row
+        cmp #SELBAR_OFF
+        beq @kernal
+        asl a
+        asl a
+        asl a
+        clc
+        adc #ROW0_LINE - 1              ; last line of the row above
+        ldx _selbar_color
+        jsr selbar_at_end
+        lda selbar_line
+        clc
+        adc #8                          ; last line of the bar row
+        ldx _selbar_bg
+        jsr selbar_at_end
+@kernal:
+        jsr selbar_next
+        jmp $ea31                       ; KERNAL interrupt code

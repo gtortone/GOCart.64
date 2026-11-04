@@ -1,10 +1,7 @@
 
-- build launcher
-
-cd launcher
-make
-
-- build GOCart.64 firmware
+- build GOCart.64 firmware (the launcher is built by CMake too, with cc65;
+  options: -DCC65_BIN_DIR=<dir> -DCC65_HOME=<dir> -DGOCART_LAUNCHER_VERSION=<x.y>
+  -DGOCART_LAUNCHER_THEME=<n>)
 
 cmake -B build/release -DPICO_BOARD=weact_rp2350b_core
 cmake -B build/debug -DPICO_BOARD=weact_rp2350b_core -DDEBUG=ON

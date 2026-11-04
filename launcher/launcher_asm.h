@@ -33,4 +33,17 @@ void kff_wait_for_sync(void);
 void wait_for_reset(void);
 uint8_t is_c128(void);
 
+// joysticks in port 1 and 2 (JOY_*_MASK bits); port 1 bits also ORed
+// into joy1_bits
+uint8_t read_joys(void);
+extern uint8_t joy1_bits;
+
+// selection bar (raster interrupt): background color of screen row
+// selbar_row (SELBAR_OFF: none) set to selbar_color
+#define SELBAR_OFF 0xff
+void selbar_init(void);
+extern uint8_t selbar_row;
+extern uint8_t selbar_color;
+extern uint8_t selbar_bg;
+
 #endif /* _LAUNCHER_ASM_H_ */

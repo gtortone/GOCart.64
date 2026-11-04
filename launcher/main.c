@@ -79,21 +79,47 @@ static uint8_t *bigBuffer = NULL;
 static uint16_t *pageBuffer = NULL;
 static Directory *dir = NULL;
 
-#define KUNG_FU_FLASH_VER "Kung Fu Flash v" ## KFF_VER
+#define PROGRAM_NAME_VER "GOCart.64 v" GOCART_VER
 
 // Place program name in the start of the output file
 // so it can be read by the firmware
 #pragma rodata-name (push, "LOWCODE")
-const char programNameVer[FW_NAME_SIZE] = KUNG_FU_FLASH_VER;
+const char programNameVer[FW_NAME_SIZE] = PROGRAM_NAME_VER;
 #pragma rodata-name (pop)
 
-static const char programBar[] = {"          " KUNG_FU_FLASH_VER "           "};
-static const char menuBar[] =    {"          " KUNG_FU_FLASH_VER "  <F1> Help"};
+// status bars (SCREENW characters), built by initBars()
+static char programBar[SCREENW+1];      // name and version, centered
+static char menuBar[SCREENW+1];         // name and version, help key
+
+// clear the screen, without the selection bar
+static void clearScreen(void)
+{
+    selbar_row = SELBAR_OFF;
+    clrscr();
+}
+
+static void initBars(void)
+{
+    uint8_t len = strlen(PROGRAM_NAME_VER);
+
+    memset(programBar, ' ', SCREENW);
+    programBar[SCREENW] = 0;
+    memcpy(programBar + (SCREENW - len) / 2, PROGRAM_NAME_VER, len);
+
+    memset(menuBar, ' ', SCREENW);
+    menuBar[SCREENW] = 0;
+    memcpy(menuBar + 1, PROGRAM_NAME_VER, len);
+    memcpy(menuBar + SCREENW - 10, "<F1> Help", 9);
+}
 
 int main(void)
 {
     uint8_t i, tmp, tst;
-    initScreen(COLOR_BLACK, COLOR_BLACK, TEXTC);
+    initBars();
+    initScreen(BORDERC, BGC, TEXTC);
+    selbar_color = SELC;
+    selbar_bg = BGC;
+    selbar_init();
 
     dir = (Directory *)malloc(sizeof(Directory));
     bigBuffer = (uint8_t *)dir;
@@ -238,7 +264,7 @@ static void mainLoopKFF(void)
                 continue;
 
             case CMD_WAIT_SYNC:
-                clrscr();
+                clearScreen();
                 kff_wait_for_sync();
                 break;
 
@@ -280,7 +306,7 @@ static void showTextPage(uint16_t page)
 {
     uint8_t i, chr, last_c = 0;
 
-    clrscr();
+    clearScreen();
     revers(1);
     textcolor(BACKC);
     gotoxy(0, 0);
@@ -345,7 +371,7 @@ static void textReaderLoop(void)
     waitRelease();
     while (true)
     {
-        c = kbhit() ? cgetc() : getJoy();
+        c = keyHit() ? cgetc() : getJoy();
         switch (c)
         {
             case CH_ENTER:
@@ -385,7 +411,7 @@ static void textReaderLoop(void)
 
 static void updateScreen(void)
 {
-    clrscr();
+    clearScreen();
     revers(0);
     textcolor(BACKC);
     drawFrame();
@@ -451,7 +477,7 @@ static uint8_t menuLoop(void)
                 return cmd;
         }
 
-        c = kbhit() ? cgetc() : getJoy();
+        c = keyHit() ? cgetc() : getJoy();
         switch (c)
         {
             case CH_NONE:
@@ -649,7 +675,7 @@ static uint8_t search(uint8_t c)
     printElement(last_selected);
     dir->selected = last_selected;
 
-    textcolor(TEXTC);
+    textcolor(SELC);
     revers(1);
     memcpy(inputBuffer, searchBuffer, searchLen);
 
@@ -777,7 +803,7 @@ static uint8_t search(uint8_t c)
             }
             cursor_delay--;
 
-            if (kbhit())
+            if (keyHit())
             {
                 c = cgetc();
                 if (c != CH_CURS_UP && c != CH_CURS_DOWN)
@@ -859,35 +885,38 @@ static void showDir(void)
 
 static void help(void)
 {
-    clrscr();
+    uint8_t i, len = strlen(PROGRAM_NAME_VER);
+
+    clearScreen();
     revers(0);
     textcolor(TEXTC);
     cputsxy(0, 0, programBar);
     textcolor(BACKC);
-    cputsxy(10, 1, "\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3\xa3");
+    gotoxy((SCREENW - len) / 2, 1);
+    for (i=0; i<len; i++)
+    {
+        cputc(0xa3);
+    }
 
-    cputsxy(1, 2, "codeberg.org/KimJorgensen/KungFuFlash2");
+    cputsxy(5, 2, "github.com/gtortone/GOCart.64");
 
     textcolor(TEXTC);
     cputsxy(0, 5, "<CRSR> or Joy       Change selection");
     cputsxy(0, 6, "<RETURN> or Fire    Run/Change Dir");
-    cputsxy(0, 7, " + <SHIFT> or Hold  Options");
-    cputsxy(0, 8, "<HOME>              Root Dir");
-    cputsxy(0, 9, "<DEL> or Fire left  Dir Up");
-    cputsxy(0, 10, "<A-Z> or Fire up    Search");
-    cputsxy(0, 11, "<F1> or Fire down   Help");
-    cputsxy(0, 12, "<F5> or Fire right  Settings");
-    cputsxy(0, 13, "<F6>                C128 Mode");
-    cputsxy(0, 14, "<F7>                BASIC (Cart Active)");
-    cputsxy(0, 15, "<F8>                Kill");
-    cputsxy(0, 16, "<RUN/STOP>          Reset");
+    cputsxy(0, 7, "<HOME>              Root Dir");
+    cputsxy(0, 8, "<DEL> or Fire left  Dir Up");
+    cputsxy(0, 9, "<A-Z> or Fire up    Search");
+    cputsxy(0, 10, "<F1> or Fire down   Help");
 
-    cputsxy(0, 18, "Use joystick in port 2");
+    cputsxy(0, 12, "Joystick in port 1 or 2");
 
-    textcolor(COLOR_RED);
-    cputsxy(0, 20, "KUNG FU FLASH IS PROVIDED WITH NO");
+    textcolor(BACKC);
+    cputsxy(0, 15, "Based on Kung Fu Flash by Kim Jorgensen");
+
+    textcolor(ERRORC);
+    cputsxy(0, 20, "GOCART.64 IS PROVIDED WITH NO");
     cputsxy(0, 21, "WARRANTY OF ANY KIND.");
-    textcolor(COLOR_LIGHTRED);
+    textcolor(WARNC);
     cputsxy(0, 22, "USE IT AT YOUR OWN RISK!");
 
     gotoxy(0, 24);
@@ -923,23 +952,22 @@ static void printElement(uint8_t element_no)
     char *element;
 
     element = dir->elements[element_no];
-    if (*element++ == TEXT_ELEMENT)
-    {
-        textcolor(WARNC);
-    }
-    else
-    {
-        textcolor(TEXTC);
-    }
-
     if (element_no == dir->selected)
     {
-        revers(1);
+        // normal characters on the selection bar (raster interrupt)
+        element++;
+        textcolor(SELTXTC);
+        selbar_row = 1 + element_no;
     }
     else
     {
-        revers(0);
+        textcolor(*element++ == TEXT_ELEMENT ? WARNC : TEXTC);
+        if (selbar_row == 1 + element_no)
+        {
+            selbar_row = SELBAR_OFF;
+        }
     }
+    revers(0);
 
     cputsxy(1, 1+element_no, element);
     revers(0);
@@ -947,7 +975,7 @@ static void printElement(uint8_t element_no)
 
 static void showMessage(const char *text, uint8_t color)
 {
-    clrscr();
+    clearScreen();
 
     revers(1);
     textcolor(BACKC);
