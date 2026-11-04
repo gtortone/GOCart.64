@@ -31,4 +31,20 @@ void ef_save_flush(void);
 // write a pending save and forget the current save file (cartridge stopped)
 void ef_save_stop(void);
 
+/*
+ * GMod2 EEPROM file "<name>.eep" (see ef_save.cpp)
+ */
+
+// GMod2 cartridge loaded (core1 not started yet): data (size bytes) filled
+// from "<name>.eep", erased ($FF) if missing. file_name: CRT file, NULL: not
+// saved
+void gmod2_eep_start(const char *file_name, uint8_t *data, uint32_t size);
+
+// core0, often: changes = EEPROM writes counted by core1; the file is
+// written a while after the last change
+void gmod2_eep_poll(uint32_t changes);
+
+// cartridge stopped: write pending changes, forget the file
+void gmod2_eep_stop(uint32_t changes);
+
 #endif

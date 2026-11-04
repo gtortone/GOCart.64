@@ -74,6 +74,8 @@
 
 /*
  * Bus timing tuning, in CPU cycles (4 ns each @ 250 MHz). 0 = disabled.
+ * C64_BUS_EDGE_DELAY_CYCLES and C64_BUS_HOLD_CYCLES are the defaults of
+ * c64_bus_edge_cycles / c64_bus_hold_cycles (see below).
  *
  * C64_BUS_EDGE_DELAY_CYCLES
  *   delay after every PHI2 edge before the bus is sampled. Masks select lines
@@ -100,8 +102,7 @@
 /*
  * early_commit(): first sample of a write cycle (on a COMMIT_SEL line) passed
  * to early_commit(). 1 = from the first sample, like the original firmware
- * (6510 write data is valid ~150 ns after PHI2 rises, a sample takes ~50 ns).
- */
+ * (6510 write data is valid ~150 ns after PHI2 rises, a sample takes ~50 ns). */
 #ifndef C64_BUS_EARLY_COMMIT_SAMPLES
 #define C64_BUS_EARLY_COMMIT_SAMPLES   1
 #endif
@@ -131,18 +132,26 @@
 #define C64_BUS_BA_READ_FILTER   1
 #endif
 
-// extra: per-cart delay (EDGE_DELAY, compile time constant)
-BUS_INLINE void bus_edge_delay(uint32_t extra = 0) {
-   if (C64_BUS_EDGE_DELAY_CYCLES > 0)
-      busy_wait_at_least_cycles(C64_BUS_EDGE_DELAY_CYCLES);
-   if (extra > 0)
-      busy_wait_at_least_cycles(extra);
+/*
+ * Edge delay and hold time used by the bus loop, in CPU cycles. They start
+ * as C64_BUS_EDGE_DELAY_CYCLES / C64_BUS_HOLD_CYCLES and can be changed at
+ * run time (shell "bus", saved in the configuration file, see config.h):
+ * the right values depend on the C64 (PLA, board revision). They are read
+ * once when a cartridge handler starts its bus loop (c64_bus.cpp).
+ */
+extern volatile uint32_t c64_bus_edge_cycles;
+extern volatile uint32_t c64_bus_hold_cycles;
+
+// delay after a PHI2 edge (cycles: edge delay + per-cart EDGE_DELAY)
+BUS_INLINE void bus_edge_delay(uint32_t cycles) {
+   if (cycles > 0)
+      busy_wait_at_least_cycles(cycles);
 }
 
-// release the data bus at the end of a phase, after the hold time
-BUS_INLINE void bus_release(void) {
-   if (C64_BUS_HOLD_CYCLES > 0)
-      busy_wait_at_least_cycles(C64_BUS_HOLD_CYCLES);
+// release the data bus at the end of a phase, after the hold time (cycles)
+BUS_INLINE void bus_release(uint32_t hold) {
+   if (hold > 0)
+      busy_wait_at_least_cycles(hold);
    SET_DATA_MODE_IN
 }
 
@@ -166,7 +175,7 @@ template <typename T>
 struct bus_has_early_commit<T, std::void_t<decltype(&T::early_commit)>> : std::true_type {};
 
 // optional per-cart extra delay after every PHI2 edge (cycles), added to
-// C64_BUS_EDGE_DELAY_CYCLES: "static constexpr uint32_t EDGE_DELAY = n;"
+// the edge delay: "static constexpr uint32_t EDGE_DELAY = n;"
 template <typename T, typename = void>
 struct bus_cart_edge : std::integral_constant<uint32_t, 0> {};
 template <typename T>
@@ -194,6 +203,10 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
    // early_commit() state
    uint32_t early_samples;
 
+   // bus timing, read once (see c64_bus_edge_cycles)
+   const uint32_t edge = c64_bus_edge_cycles + bus_cart_edge<Cart>::value;
+   const uint32_t hold = c64_bus_hold_cycles;
+
    SET_DATA_MODE_IN
 
    // start from a PHI2 rising edge
@@ -211,7 +224,7 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
       // cpu_trace: the data bus was driven in this phase (bit 31 of the record)
       uint32_t drove = 0;
 
-      bus_edge_delay(bus_cart_edge<Cart>::value);
+      bus_edge_delay(edge);
 
       while(1) {
 
@@ -248,7 +261,7 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
          }
       }
 
-      bus_release();
+      bus_release(hold);
 
       //
       // commit (PHI2 falling edge)
@@ -267,7 +280,7 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
       //
       if (cart.vic_enabled()) {
 
-         bus_edge_delay(bus_cart_edge<Cart>::value);
+         bus_edge_delay(edge);
 
          while(1) {
 
@@ -283,7 +296,7 @@ BUS_INLINE void c64_bus_loop(Cart &cart) {
             }
          }
 
-         bus_release();
+         bus_release(hold);
 
       } else {
 

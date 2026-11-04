@@ -44,7 +44,10 @@ typedef struct {
 } SAVE_RECORD;
 #pragma pack(pop)
 
+// save file path; also the GMod2 EEPROM file path (eep_path): EasyFlash and
+// GMod2 never run at the same time
 static char save_path[256 + 64];                  // "" = no save file
+static const uint8_t *eep_data;                   // GMod2 EEPROM, NULL = not running
 static uint32_t save_crt_size;
 static uint32_t save_crt_hash;
 static uint8_t save_modified[EF_BANKS * 2 / 8];   // chunks different from the CRT
@@ -70,36 +73,41 @@ uint32_t ef_save_hash(const uint8_t *data, uint32_t len) {
    return h;
 }
 
-// "<dir>/<name>.crt" -> "<dir>/<name>.sav" (absolute: the directory may change)
-static bool save_set_path(const char *file_name) {
+// "<dir>/<name>.crt" -> "<dir>/<name><ext>" in out (absolute: the directory
+// may change); false (out = "") if it does not fit in max bytes
+static bool make_path(char *out, size_t max, const char *file_name, const char *ext) {
 
-   save_path[0] = 0;
-   size_t max = sizeof(save_path) - sizeof(SAVE_TMP_EXT) - sizeof(SAVE_EXT);
+   out[0] = 0;
+   max -= strlen(ext) + sizeof(SAVE_TMP_EXT);
 
    if (file_name[0] == '/' || strchr(file_name, ':')) {
       if (strlen(file_name) >= max)
          return false;
-      strcpy(save_path, file_name);
+      strcpy(out, file_name);
    } else {
-      if (!dir_current(save_path, max))
+      if (!dir_current(out, max))
          return false;
-      size_t len = strlen(save_path);
+      size_t len = strlen(out);
       if (len + 1 + strlen(file_name) >= max) {
-         save_path[0] = 0;
+         out[0] = 0;
          return false;
       }
-      if (len && save_path[len - 1] != '/')
-         strcat(save_path, "/");
-      strcat(save_path, file_name);
+      if (len && out[len - 1] != '/')
+         strcat(out, "/");
+      strcat(out, file_name);
    }
 
    // replace the extension
-   char *slash = strrchr(save_path, '/');
-   char *dot = strrchr(save_path, '.');
+   char *slash = strrchr(out, '/');
+   char *dot = strrchr(out, '.');
    if (dot && (!slash || dot > slash))
       *dot = 0;
-   strcat(save_path, SAVE_EXT);
+   strcat(out, ext);
    return true;
+}
+
+static bool save_set_path(const char *file_name) {
+   return make_path(save_path, sizeof(save_path), file_name, SAVE_EXT);
 }
 
 // apply the save file to the cartridge data (before core1 starts)
@@ -207,7 +215,8 @@ void ef_save_flush(void) {
 void ef_save_stop(void) {
    if (save_pending)
       ef_save_flush();
-   save_path[0] = 0;
+   if (!eep_data)            // the path is the GMod2 EEPROM one (gmod2_eep_stop)
+      save_path[0] = 0;
    save_pending = false;
    memset(save_modified, 0, sizeof(save_modified));
 }
@@ -225,4 +234,90 @@ void ef_save_start(const char *file_name, uint32_t crt_size, uint32_t crt_hash) 
 // the cartridge stopped writing: time to write the save file
 bool ef_save_due(void) {
    return save_pending && time_us_64() - save_last_change > SAVE_DELAY_US;
+}
+
+/*
+ * GMod2 EEPROM file "<name>.eep" next to the CRT: the 2K of the 93C86
+ * EEPROM, raw (word n: byte 2n high, 2n + 1 low). Loaded when the CRT is
+ * started (erased if missing), written EEP_DELAY_US after the last EEPROM
+ * write (the cartridge keeps running), or when the cartridge is stopped.
+ */
+#define EEP_EXT           ".eep"
+#define EEP_DELAY_US      (1000 * 1000)
+
+#define eep_path    save_path                     // "" = not saved
+static uint32_t eep_size;
+static uint32_t eep_seen;                         // changes counter seen
+static bool eep_pending;
+static uint64_t eep_last_change;
+
+void gmod2_eep_start(const char *file_name, uint8_t *data, uint32_t size) {
+
+   eep_data = data;
+   eep_size = size;
+   eep_pending = false;
+   eep_seen = 0;
+   memset(data, 0xFF, size);
+
+   if (!file_name || !make_path(eep_path, sizeof(eep_path), file_name, EEP_EXT)) {
+      printf("W: GMod2 EEPROM changes will not be saved\n");
+      return;
+   }
+
+   FIL file;
+   if (!file_open(&file, eep_path, FA_READ))
+      return;     // no EEPROM file yet
+   bool ok = file_read(&file, data, size) == size;
+   file_close(&file);
+   if (ok) {
+      printf("GMod2: EEPROM loaded from %s\n", eep_path);
+   } else {
+      memset(data, 0xFF, size);
+      printf("E: %s not valid\n", eep_path);
+   }
+}
+
+static void eep_flush(void) {
+
+   eep_pending = false;
+   if (!eep_path[0] || !eep_data)
+      return;
+
+   char tmp_path[sizeof(eep_path)];
+   strcpy(tmp_path, eep_path);
+   strcat(tmp_path, SAVE_TMP_EXT);
+
+   FIL file;
+   bool ok = file_open(&file, tmp_path, FA_WRITE | FA_CREATE_ALWAYS) &&
+             file_write(&file, (void *)eep_data, eep_size) == eep_size;
+   ok = file_close(&file) && ok;
+   if (ok) {
+      f_unlink(eep_path);
+      ok = f_rename(tmp_path, eep_path) == FR_OK;
+   }
+
+   if (ok)
+      printf("GMod2: EEPROM saved to %s\n", eep_path);
+   else
+      printf("E: failed to write %s\n", eep_path);
+}
+
+void gmod2_eep_poll(uint32_t changes) {
+   if (!eep_data)
+      return;
+   if (changes != eep_seen) {
+      eep_seen = changes;
+      eep_pending = true;
+      eep_last_change = time_us_64();
+   } else if (eep_pending && time_us_64() - eep_last_change > EEP_DELAY_US) {
+      eep_flush();
+   }
+}
+
+void gmod2_eep_stop(uint32_t changes) {
+   if (eep_data && (eep_pending || changes != eep_seen))
+      eep_flush();
+   eep_data = NULL;
+   eep_path[0] = 0;
+   eep_pending = false;
 }

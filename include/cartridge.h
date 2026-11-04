@@ -7,7 +7,7 @@
 #include "Reader.h"
 #include "CRTParser.h"
 
-#define BANKS_NUM          30
+#define BANKS_NUM          28      // 448K: larger EasyFlash/8K bank images go to the PSRAM
 #define CRT_BUFFER_SIZE    (BANKS_NUM * 16 * 1024)
 
 extern uint8_t crt_buf[CRT_BUFFER_SIZE];
@@ -97,6 +97,7 @@ void run_cart_warp_speed(void);
 void run_cart_comal80(void);
 void run_cart_prophet64(void);
 void run_cart_rgcd(void);
+void run_cart_gmod2(void);
 void run_cart_kff(void);
 void run_cart_ef3(void);
 
@@ -115,7 +116,5 @@ void kff_dump(void);
 bool ef_chunk_read(uint8_t bank, bool romh, uint32_t ofs, uint8_t *dst, uint32_t len);
 bool ef_chunk_write(uint8_t bank, bool romh, uint32_t ofs, const uint8_t *src, uint32_t len);
 
-// shell "cputrace" command (EF_DEBUG_CPU_TRACE in cartridge.cpp, DEBUG build)
-void cpu_trace_shell(char *args);
 
 #endif

@@ -1,3 +1,8 @@
+/*
+ * WeAct Studio RP2350B Core, without PSRAM
+ * (with PSRAM: weact_rp2350b_core_psram.h, which includes this file)
+ */
+
 #ifndef WEACT_RP2350B_CORE_BOARD
 #define WEACT_RP2350B_CORE_BOARD
 
@@ -64,14 +69,13 @@ pico_board_cmake_set_default(PICO_RP2350_A2_SUPPORTED, 1)
 #define GC_EXROM_PIN          45
 
 //------------- PSRAM ------------//
-// QMI CS1 (XIP_CS1 is only on GPIO 0, 8, 19, 47). The PSRAM footprint on the
-// bottom side has CS on GPIO 0 (C64 A0): it is rewired to GPIO 47, which is
-// no longer used by BUTTON2
-#define GC_PSRAM_CS_PIN       47
+// GC_PSRAM_CS_PIN: set by weact_rp2350b_core_psram.h (board with the PSRAM)
 
 //------------ buttons ----------//
 #define GC_BUTTON1_PIN        46
-// GC_BUTTON2_PIN: GPIO 47 is the PSRAM chip select
+#ifndef GC_PSRAM_CS_PIN
+#define GC_BUTTON2_PIN        47    // with the PSRAM: its chip select
+#endif
 
 //------------ debug ------------//
 // UART1 on the free pins of the EXT SPI header (GPIO 40/41 are used by the

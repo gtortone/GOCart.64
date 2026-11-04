@@ -4,6 +4,11 @@
 #include "c64_interface.h"
 #include "board.h"
 #include "dma_bus.pio.h"
+#include "c64_bus.h"
+
+// bus loop timing (see c64_bus.h), set from the configuration file
+volatile uint32_t c64_bus_edge_cycles = C64_BUS_EDGE_DELAY_CYCLES;
+volatile uint32_t c64_bus_hold_cycles = C64_BUS_HOLD_CYCLES;
 
 uint dma_bus_offset;
 
