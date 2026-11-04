@@ -149,8 +149,8 @@ private:
       } else if(type == 18) {
          // Zaxxon: always 16K mode
          exrom = game = 0;
-      } else if(type == 15 || type == 43 || type == 57 || type == 12) {
-         // C64 Game System, Prophet64, RGCD, Rex Utility: 8K mode
+      } else if(type == 15 || type == 43 || type == 57 || type == 12 || type == 60) {
+         // C64 Game System, Prophet64, RGCD, Rex Utility, GMod2: 8K mode
          exrom = 0;
          game = 1;
       } else if(type == 11 || type == 13 || type == 16 || type == 21) {
@@ -203,16 +203,12 @@ private:
          return NEXT_CHIP;
       }
 
-      if (type == 5) {
-         if (!parseOceanChip(number, startAddr, blockLen))
-            return false;
-         addChip(chipType, number, startAddr, blockLen);
-         return NEXT_CHIP;
-      }
-
-      // C64 Game System: up to 64 banks of 8K (512K), packed (see parse8KPackedChip)
-      if (type == 15) {
-         if (!parse8KPackedChip(number, startAddr, blockLen))
+      // 8K banks packed as chunks (see parse8KPackedChip): Ocean, C64 Game
+      // System, GMod2 (64 banks, 512K), Magic Desk (128 banks, 1 MB)
+      if (type == 5 || type == 15 || type == 19 || type == 60) {
+         if (type == 5 && startAddr == 0xA000)
+            has_romh = true;      // Ocean: 16K mode
+         if (!parse8KPackedChip(number, startAddr, blockLen, type == 19 ? 2 * EF_BANKS : EF_BANKS))
             return false;
          addChip(chipType, number, startAddr, blockLen);
          return NEXT_CHIP;
@@ -300,34 +296,6 @@ private:
    }
 
    /*
-    * Ocean
-    *
-    * One bank register ($DE00) selects an 8K bank, mapped at both ROML and
-    * ROMH (like VICE). The chips are placed by bank number: the load address
-    * in the CRT is not meaningful (256K images have banks 16-31 either at
-    * $8000 or at $A000). Bank n is at crt_buf + n * 8K.
-    */
-   bool parseOceanChip(uint8_t number, uint16_t startAddr, uint16_t blockLen) {
-
-      if (blockLen != 8*1024 || number >= 64 ||
-          (startAddr != 0x8000 && startAddr != 0xA000)) {
-         printf("E: Ocean chip not supported (bank %d, $%04X, %d bytes)\n", number, startAddr, blockLen);
-         return false;
-      }
-
-      if (startAddr == 0xA000)
-         has_romh = true;
-
-      uint32_t ofs = (uint32_t)number * 8*1024;
-      if (ofs + blockLen > crt_buf_size) {
-         printf("E: CRT too large for buffer (bank %d, offset %lu)\n", number, (unsigned long)ofs);
-         return false;
-      }
-
-      return reader.read(crt_buf + ofs, blockLen);
-   }
-
-   /*
     * Cartridges with 8K banks at ROML selected by a register (C64 Game System,
     * Prophet64, RGCD): bank n at crt_buf + n * 8K. The load address in the
     * CRT is not meaningful (RGCD images use $8000 or $A000).
@@ -350,66 +318,92 @@ private:
    }
 
    /*
-    * Cartridges with up to 64 banks of 8K at ROML (C64 Game System, 512K
-    * images): the chips are packed as 8K chunks like EasyFlash ROML, so that
-    * images padded with erased or repeated banks fit in crt_buf.
+    * Cartridges with 8K banks selected by a register: Ocean, C64 Game System,
+    * GMod2 (up to 64 banks, 512K), Magic Desk (up to 128, 1 MB). The chips are
+    * packed as 8K chunks like EasyFlash ROML, so that images padded with
+    * erased or repeated banks fit in crt_buf, and the same chunk cache can
+    * be used when the image is in the PSRAM:
     *   crt_map[bank] -> chunk index (crt_buf + n * 8K), EF_CHUNK_NONE: erased
     * An erased (all $FF) bank takes no chunk, a bank equal to a previous one
-    * shares its chunk. getEasyFlashChunks() returns the chunks used.
+    * shares its chunk (not in the PSRAM: comparing would take too long).
+    * getEasyFlashChunks() returns the chunks used. The load address in the
+    * CRT is not meaningful (Ocean 256K images have banks 16-31 either at
+    * $8000 or at $A000). A 16K chip at $8000 holds banks 2n and 2n + 1
+    * (Magic Desk images converted from 16K banks).
     */
-   bool parse8KPackedChip(uint8_t number, uint16_t startAddr, uint16_t blockLen) {
+   bool parse8KPackedChip(uint8_t number, uint16_t startAddr, uint16_t blockLen, uint32_t max_banks) {
 
-      if (blockLen != 8*1024 || number >= EF_BANKS ||
-          (startAddr != 0x8000 && startAddr != 0xA000) || crt_map_size < EF_BANKS) {
+      uint32_t first = number, count = 1;
+      if (blockLen == 16*1024 && startAddr == 0x8000) {
+         first = (uint32_t)number * 2;
+         count = 2;
+      } else if (blockLen != 8*1024 || (startAddr != 0x8000 && startAddr != 0xA000)) {
+         first = max_banks;      // not supported
+      }
+      if (first + count > max_banks || crt_map_size < max_banks) {
          printf("E: chip not supported (bank %d, $%04X, %d bytes)\n", number, startAddr, blockLen);
          return false;
       }
 
       if (!ef_init) {
-         memset(crt_map, EF_CHUNK_NONE, EF_BANKS);
+         memset(crt_map, EF_CHUNK_NONE, crt_map_size);
          ef_chunks = 0;
          ef_init = true;
       }
 
+      for (uint32_t b = first; b < first + count; b++) {
+         if (!pack8KChunk(b))
+            return false;
+      }
+      return true;
+   }
+
+   // read 8K into the next chunk, map it to bank (see parse8KPackedChip)
+   bool pack8KChunk(uint32_t bank) {
+
+      const uint32_t len = 8*1024;
+
       // buffer full: only an erased bank can still be accepted
       if ((uint32_t)(ef_chunks + 1) * EF_CHUNK_SIZE > crt_buf_size) {
          uint8_t part[64];
-         for (uint16_t ofs = 0; ofs < blockLen; ofs += sizeof(part)) {
+         for (uint32_t ofs = 0; ofs < len; ofs += sizeof(part)) {
             if (!reader.read(part, sizeof(part)))
                return false;
             for (uint8_t i = 0; i < sizeof(part); i++) {
                if (part[i] != 0xFF) {
-                  printf("E: CRT too large for buffer (bank %d)\n", number);
+                  printf("E: CRT too large for buffer (bank %lu)\n", (unsigned long)bank);
                   return false;
                }
             }
          }
-         crt_map[number] = EF_CHUNK_NONE;
+         crt_map[bank] = EF_CHUNK_NONE;
          return true;
       }
 
       uint8_t *dst = crt_buf + (uint32_t)ef_chunks * EF_CHUNK_SIZE;
-      if (!reader.read(dst, blockLen))
+      if (!reader.read(dst, len))
          return false;
 
       // erased bank
-      uint16_t i = 0;
-      while (i < blockLen && dst[i] == 0xFF)
+      uint32_t i = 0;
+      while (i < len && dst[i] == 0xFF)
          i++;
-      if (i == blockLen) {
-         crt_map[number] = EF_CHUNK_NONE;
+      if (i == len) {
+         crt_map[bank] = EF_CHUNK_NONE;
          return true;
       }
 
-      // same data as a previous bank
-      for (uint8_t c = 0; c < ef_chunks; c++) {
-         if (memcmp(crt_buf + (uint32_t)c * EF_CHUNK_SIZE, dst, blockLen) == 0) {
-            crt_map[number] = c;
-            return true;
+      // same data as a previous bank (crt_buf in SRAM only)
+      if ((uintptr_t)crt_buf >= 0x20000000u) {
+         for (uint8_t c = 0; c < ef_chunks; c++) {
+            if (memcmp(crt_buf + (uint32_t)c * EF_CHUNK_SIZE, dst, len) == 0) {
+               crt_map[bank] = c;
+               return true;
+            }
          }
       }
 
-      crt_map[number] = ef_chunks++;
+      crt_map[bank] = ef_chunks++;
       return true;
    }
 

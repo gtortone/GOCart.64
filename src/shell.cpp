@@ -13,6 +13,11 @@
 #include "filesystem.h"
 #include "menu.h"
 #include "shell_test.h"
+#include "psram.h"
+#include "c64_bus.h"
+#include "config.h"
+#include "FileReader.h"
+#include "bus_diag.h"
 
 #define CMD_BUFFER_SIZE    128
 #define PATH_BUFFER_SIZE   128
@@ -43,6 +48,72 @@ void print_prompt(bool init=false) {
    dir_current(path, PATH_BUFFER_SIZE);
    printf("%s:> ", path);
 
+}
+
+// shell "bus": edge delay / hold time of the bus loop (cycles, see c64_bus.h),
+// used from the next cartridge start
+//   bus                      show the values
+//   bus edge <n> hold <n>    set (each optional)
+//   bus default              back to the compiled defaults
+//   bus save                 save them in the configuration file
+static void bus_shell(void) {
+   char *token;
+   while ((token = strtok(NULL, " ")) != NULL) {
+      if (strcmp(token, "edge") == 0 || strcmp(token, "hold") == 0) {
+         volatile uint32_t *v = token[0] == 'e' ? &c64_bus_edge_cycles : &c64_bus_hold_cycles;
+         char *arg = strtok(NULL, " ");
+         char *end;
+         unsigned long n = arg ? strtoul(arg, &end, 10) : 0;
+         if (!arg || *end || n > CONFIG_BUS_MAX) {
+            printf("bus: %s needs a value 0-%d\n", token, CONFIG_BUS_MAX);
+            return;
+         }
+         *v = n;
+      } else if (strcmp(token, "default") == 0) {
+         c64_bus_edge_cycles = C64_BUS_EDGE_DELAY_CYCLES;
+         c64_bus_hold_cycles = C64_BUS_HOLD_CYCLES;
+      } else if (strcmp(token, "save") == 0) {
+         printf("bus: %s\n", config_save() ? "saved" : "save FAILED");
+#ifdef DEBUG
+      } else if (strcmp(token, "scan") == 0) {
+         // bus scan <file.crt> [seconds [from to [step [repeat]]]]: EasyFlash
+         // cartridge started with every edge delay, crashes detected
+         char *file = strtok(NULL, " ");
+         char *a[5];
+         unsigned long v[5] = { 20, 0, 20, 2, 1 };
+         int n = 0;
+         while (n < 5 && (a[n] = strtok(NULL, " ")) != NULL) {
+            char *end;
+            v[n] = strtoul(a[n], &end, 10);
+            if (*end || v[n] > CONFIG_BUS_MAX) {
+               printf("bus: scan: %s not valid\n", a[n]);
+               return;
+            }
+            n++;
+         }
+         if (!file || v[0] == 0 || v[1] > v[2]) {
+            printf("usage: bus scan <file.crt> [seconds [from to [step [repeat]]]] (default 20 0 20 2 1)\n");
+            return;
+         }
+         FileReader fr(file);
+         bus_scan_request(v[0], v[1], v[2], v[3], v[4]);
+         if (run_cart(fr, file) != 0)
+            printf("bus: scan: %s not started\n", file);
+         bus_scan_request(0, 0, 0, 1, 1); // not an EasyFlash cartridge: no scan later
+         return;
+#endif
+      } else {
+         printf("usage: bus [edge <n>] [hold <n>] [default] [save]\n"
+                "       bus scan <file.crt> [seconds [from to [step [repeat]]]]\n");
+         return;
+      }
+   }
+   uint32_t mhz = clock_get_hz(clk_sys) / 1000000;
+   printf("bus: edge %lu cycles (%lu ns), hold %lu cycles (%lu ns), default %d/%d; "
+          "used from the next cartridge start\n",
+          (unsigned long)c64_bus_edge_cycles, (unsigned long)(c64_bus_edge_cycles * 1000 / mhz),
+          (unsigned long)c64_bus_hold_cycles, (unsigned long)(c64_bus_hold_cycles * 1000 / mhz),
+          C64_BUS_EDGE_DELAY_CYCLES, C64_BUS_HOLD_CYCLES);
 }
 
 void poll_shell(void) {
@@ -132,8 +203,14 @@ void poll_shell(void) {
                   pattern = token;
             }
             shell_test(pattern, start, clean);
+         } else if (strcmp(token, "bus") == 0) {
+            // bus loop timing: bus [edge <n>] [hold <n>] [default] [save]
+            bus_shell();
+         } else if (strcmp(token, "psram") == 0) {
+            // PSRAM info, memory test: psram [test [kb]]
+            psram_shell(strtok(NULL, ""));
          } else if (strcmp(token, "cputrace") == 0) {
-            // EasyFlash CPU trace (EF_DEBUG_CPU_TRACE in cartridge.cpp)
+            // EasyFlash CPU trace (EF_DEBUG_CPU_TRACE in bus_diag.h)
             cpu_trace_shell(strtok(NULL, ""));
          } else if (strcmp(token, "clean") == 0) {
             // power-on like C64 state (RAM, VIC-II, SID cleared)

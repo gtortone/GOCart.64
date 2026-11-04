@@ -10,10 +10,12 @@
 #include "menu.h"
 #include "shell.h"
 #include "config.h"
+#include "psram.h"
 
 int main(void) {
    
    board_setup();
+   psram_init();
 
    c64_set_exrom_game(1, 1);         // <no cartridge>
    c64_hold_reset();

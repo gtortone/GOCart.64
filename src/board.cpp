@@ -9,6 +9,7 @@
 #include "hardware/structs/xip_ctrl.h"
 
 #include "board.h"
+#include "c64_interface.h"
 #include "debug.h"
 
 void board_setup(void) {
@@ -23,17 +24,16 @@ void board_setup(void) {
 
 #ifdef DEBUG
    #ifdef PICO_UART_CONSOLE
+      // TX only when UART_RX is -1 (the shell input is on USB)
       gpio_set_function(UART_TX, UART_FUNCSEL_NUM(UART_ID, UART_TX));
+      #if GC_DBG_UART_RX_PIN >= 0
       gpio_set_function(UART_RX, UART_FUNCSEL_NUM(UART_ID, UART_RX));
+      #endif
       stdio_uart_init_full(UART_ID, 115200, UART_TX, UART_RX);
    #endif
    stdio_init_all();
    sleep_ms(500);
 #endif
-
-   // configure PSRAM
-   //gpio_set_function(PSRAM_CS, GPIO_FUNC_XIP_CS1); // CS for PSRAM
-	//xip_ctrl_hw->ctrl |= XIP_CTRL_WRITABLE_M1_BITS;
 
    gpio_init(I2C_SDA);
    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
@@ -88,9 +88,13 @@ void board_setup(void) {
    gpio_init(RESET);
    gpio_set_dir(RESET, GPIO_OUT);
 
-   //gpio_init(DMA);
-   //gpio_disable_pulls(DMA);
-   //gpio_set_dir(DMA, GPIO_IN);
+   // DMA: connected directly to the expansion port (pull-up to 5 V on the
+   // C64): open drain, output 0 when asserted (c64_dma_assert), else input
+   gpio_init(DMA);
+   gpio_disable_pulls(DMA);
+   gpio_put(DMA, 0);
+   gpio_set_dir(DMA, GPIO_IN);
+   c64_dma_bus_init();
 
    gpio_init(DOTCLK);
    gpio_disable_pulls(DOTCLK);
